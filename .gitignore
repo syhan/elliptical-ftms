@@ -1,0 +1,6 @@
+data/
+__pycache__/
+*.pyc
+
+# 本地配置（含设备 MAC 与个人信息），用 config.toml.example 作模板
+config.toml

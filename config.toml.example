@@ -1,0 +1,32 @@
+# ftms_capture.py 配置文件模板
+#
+# 用法：
+#   cp config.toml.example config.toml
+#   然后按实际情况填写（config.toml 已被 .gitignore 忽略，不会提交）
+#
+# 优先级：命令行参数 > config.toml > 内置默认值
+#
+#   python3 ftms_capture.py --config config.toml
+
+[device]
+# 椭圆机。address 精确匹配，name 是广播名前缀（二选一，address 优先）
+address = "EB:80:03:XX:XX:XX"
+name = ""
+
+# 心率设备（可选，留空则不采集心率）
+# COROS 手表需要先在表上打开「心率广播」
+hr = ""
+hr_name = ""
+
+[profile]
+# Keytel (2005) 心率热量公式的个人参数
+# 不填的话 kcal_keytel 两列会是 0
+age = 0
+weight = 0.0
+sex = "m"          # "m" 男 / "f" 女
+
+[output]
+outdir = "data"
+prefix = "ride"
+jsonl = true       # 额外保存原始 0x2ACE 帧
+quiet = false      # true 则不打印每秒实时行
