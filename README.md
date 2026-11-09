@@ -194,12 +194,22 @@ python3 ftms_capture.py --config config.toml --hr ""
 
 ---
 
+## 许可
+
+[MIT](LICENSE) © 2026 Yihan Song
+
+协议分析结果（字段表、偏移、标定公式等）属于事实性信息，任何人可以自由使用；
+但请注意，这些结论是在一台具体的 YESOUL EF25 上验证的，其他型号/固件可能不同。
+
+---
+
 ## 文件
 
 ```
 elliptical-ftms/
 ├── README.md              # 本文件
 ├── PROTOCOL.md            # 完整协议逆向记录（字段表、标定、证据、踩坑）
+├── LICENSE                # MIT
 ├── config.toml.example    # 配置模板（复制成 config.toml 使用）
 ├── ftms_capture.py        # 采集脚本
 └── data/                  # 采集输出（已 gitignore）
