@@ -430,3 +430,72 @@ byte 0: flags
 | 总卡路里 | 长时间下 = active + 0.97 kcal/min；短时长下不稳定 | 中 |
 | 功率 | `f(步频, 阻力)`，R²=0.971 | 低（公式而非测量） |
 | offset 12/20 | 未能确定 | — |
+
+---
+
+## 12. 导出 FIT：字段映射与取舍
+
+### 12.1 为什么用 `fitness_equipment` + `elliptical`
+
+FIT profile 21.221 里：
+
+| 枚举 | 值 |
+|---|---|
+| `sport` = `fitness_equipment` | 4 |
+| `sub_sport` = `elliptical` | 15 |
+
+这是「运动类型 = 椭圆机」的唯一标准写法。如果写成 `sport=cycling`（2）+
+`sub_sport=indoor_cycling`（6），多数平台会归到室内骑行。
+
+### 12.2 字段映射表
+
+| CSV 列 | FIT record 字段 | 编号 | 缩放 | 备注 |
+|---|---|---|---|---|
+| `t_epoch` | `timestamp` | 253 | −631065600 | 转 FIT 纪元 |
+| `hr` | `heart_rate` | 3 | 1 | 需过滤 |
+| `cadence_spm` | `cadence` | 4 | 1 | uint8，上限 254 |
+| `distance_m` | `distance` | 5 | ×100 | 必须单调非减 |
+| `speed_kmh` | `speed` | 6 | ÷3.6×1000 | m/s |
+| `speed_kmh` | `enhanced_speed` | 73 | 同上 | 现代平台优先读这个 |
+| `power_w` | `power` | 7 | 1 | uint16 |
+| `resistance_pct` | `resistance` | 10 | 1 | uint8，**仅我们有** |
+| 步频积分 | `total_cycles` | 19 | 1 | 累计步数 |
+| 累计卡路里 | `calories` | 33 | 1 | 累计值，非增量 |
+
+### 12.3 没有写进 FIT 的字段
+
+| 字段 | 为什么没写 |
+|---|---|
+| `position_lat/long` | 室内固定器械，没有意义 |
+| `altitude` | 同上 |
+| `temperature` | 机器不提供 |
+| `resistance_turns` | FIT 只有 `resistance` 一个字段，turns 只能取整（精度损失） |
+| `kcal_*` 的另外两路 | FIT 只有一个 `total_calories`，多路并存得用开发者字段 |
+
+如果以后想在 FIT 里保留三路卡路里和 turns 精度，正确做法是**开发者字段**
+（`developer_data_id` + `field_description`），但多数平台的展示端不会读，
+所以当前版本没做。
+
+### 12.4 编码器实现要点
+
+`export_fit.py` 自带编码器，关键细节：
+
+1. **定义消息的「开发者字段数量」字节只在有开发者字段时才写。**
+   写了会多出一个 0x00，官方解码器会把它当成字段定义解析，导致整个文件错位。
+   这个坑最初就是这么踩到的 —— 表现为 `file_id` 后面多出一条垃圾消息。
+
+2. **CRC 是 CRC-16，但算法是 Garmin 特有的**，不是标准 CRC-16-CCITT。
+   多项式查表见代码里的 `_CRC_TABLE`。
+
+3. **头长度 14 字节**（含头部 CRC），数据区长度不含头也不含尾部 CRC。
+
+4. **字符串字段的长度 = 内容长度 + 1**，末尾补 `\0`。长度写错会让后续字段错位。
+
+验证方式：用 Garmin 官方 `garmin_fit_sdk` 编码同样的消息，**逐字节比对通过**。
+
+### 12.5 已知限制
+
+- **`resistance` 字段多数平台不展示**。COROS 导入后是否显示待实测。
+- **外部导入的活动不进 COROS 训练负荷/恢复模型**，那些只针对手表自记的活动。
+- **`total_work`（机械功 J）** 用的是功率积分，而功率本身是公式算的（§9），
+  所以这个值只反映「机器认为你做了多少功」，不是真实机械功。

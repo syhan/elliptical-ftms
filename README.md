@@ -181,6 +181,118 @@ python3 ftms_capture.py --config config.toml --hr ""
 
 ---
 
+## 导出 FIT
+
+采集完的 CSV 可以转成标准 FIT 活动文件，直接导入 COROS / Strava / Garmin Connect
+/ Intervals.icu。`export_fit.py` **不依赖任何第三方库**，自带 FIT 编码器与校验器。
+
+```bash
+# 最简：生成同名 .fit
+python3 export_fit.py data/ride_20261109_235238.csv
+
+# 指定输出
+python3 export_fit.py data/ride_20261109_235238.csv -o ~/elliptical.fit
+```
+
+### 写入 FIT 的字段
+
+| FIT 消息 | 字段 | 来源 |
+|---|---|---|
+| `file_id` | `type=activity`、`manufacturer=development`、`serial_number` | 自动 |
+| `device_info` | `device_index=creator`、`software_version` | 自动 |
+| `event` | timer start / timer stop | 首末样本时间 |
+| `record` | `timestamp` | `t_epoch` |
+| | `heart_rate` | `hr`（做过生理范围与新鲜度过滤） |
+| | `cadence` | `cadence_spm` |
+| | `power` | `power_w` |
+| | `speed` / `enhanced_speed` | `speed_kmh` ÷ 3.6 |
+| | `distance` | `distance_m` |
+| | `resistance` | `resistance_pct`（可用 `--resistance` 换口径） |
+| | `total_cycles` | 步频积分得到的累计步数 |
+| | `calories` | 累计卡路里 |
+| `lap` / `session` | `sport=fitness_equipment`、`sub_sport=elliptical` | **这就是「椭圆机」类型** |
+| | 平均/最大 心率、步频、功率、速度 | 按时间加权 |
+| | `total_cycles`、`total_distance`、`total_calories`、`total_work` | 统计 |
+| `activity` | `local_timestamp` | 自动从 `iso_time` 推导时区 |
+
+**`resistance` 是 FIT 标准字段（record 编号 10，uint8）。** 这个字段码表和手表都不会写，
+只有我们能填 —— 前提是目标平台愿意展示它（COROS 导入后是否显示待实测）。
+
+### 数据校验
+
+导出时默认做两层校验：
+
+**第一层 —— CSV 数据质量**（打印在终端）：
+
+| 检查 | 处理 |
+|---|---|
+| 时间戳缺失/非正 | 丢弃该行 |
+| 同一秒多条 | 保留最后一条 |
+| 时间倒序 | 重新排序并计数 |
+| 速度 > 70 km/h | 判为脏数据丢弃 |
+| 步频 > 255、功率 > 2000 W、阻力 > 254 | 判为脏数据丢弃 |
+| 心率超出 25–250 bpm | 置为无效 |
+| 心率超 `--max-hr-age` 秒未刷新 | 置为无效 |
+| 距离回退或缺失 | 用前一个值修补 |
+
+越界值**不做截断**——截断会把 5000 W 变成 2000 W 污染最大值，直接丢弃更诚实。
+
+**第二层 —— FIT 结构自检**（写盘前执行，不通过就不写文件）：
+
+- 头部长度 / 签名 `.FIT` / 协议版本
+- 头部 CRC 与文件 CRC
+- 声明长度与实际长度一致
+- 每个 data 消息都能找到对应定义
+- base type 合法、消息不截断
+- 必需的 `file_id` / `session` / `lap` / `record` / `activity` 齐全
+- `lap` 与 `session` 数量匹配、`activity` 恰好 1 条
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-o, --output` | 同名 `.fit` | 输出路径 |
+| `--sport` | `4` | FIT sport 枚举，4 = fitness_equipment |
+| `--sub-sport` | `elliptical` | 子类型名称或数字 |
+| `--calories` | `keytel_net` | 哪一路卡路里写进 FIT |
+| `--resistance` | `percent` | `resistance` 字段写 raw / turns / percent |
+| `--max-hr-age` | `10` | 心率过期阈值（秒） |
+| `--max-gap` | `10` | 超过该秒数的空档算停顿，不计入计时 |
+| `--device-name` | `ftms_capture` | FIT 里的设备名 |
+| `--strict` | 关 | 数据有问题时以退出码 2 结束 |
+| `--no-verify` | 关 | 跳过结构自检 |
+
+### `--calories` 选哪一路
+
+| 值 | 含义 | 可信度 |
+|---|---|---|
+| `machine` | 机器报的 `kcal_active` | 口径不明，但量级正常 |
+| `power` | 功率积分（1 kJ ≈ 1 kcal） | 口径明确，但功率本身是算出来的 |
+| `keytel` | Keytel 心率公式（含静息） | 有独立生理输入 |
+| `keytel_net` | Keytel 扣掉静息 | **默认**，最接近「运动净消耗」 |
+| `none` | 不写卡路里 | — |
+
+默认用 `keytel_net`，因为它唯一带独立生理输入。如果那场没戴心率带，
+会自动退回机器值。
+
+### 关于 `--resistance` 的口径
+
+FIT 的 `record.resistance` 是 uint8，没有单位定义。三个选项：
+
+| 值 | 写入 | 范围 | 适合 |
+|---|---|---|---|
+| `percent` | `resistance_pct` | 0–100 | **默认**，通用可读 |
+| `raw` | `resistance_raw` | 0–91 | 与 PROTOCOL.md 对齐 |
+| `turns` | `resistance_turns` | 0–6.5 | 会被取整，精度损失大 |
+
+### 导入 COROS
+
+生成的 `.fit` 在 COROS App 里走「导入」入口即可（与颂拓记录同样方式）。
+
+**注意**：外部导入的活动不会进入 COROS 的训练负荷/恢复模型，那些只针对手表自己记录的活动。
+
+---
+
 ## 注意事项
 
 - **静止约 5 分钟机器会整场重置**，距离/时间/卡路里归零。要完整记录一场就别停太久。
@@ -212,5 +324,6 @@ elliptical-ftms/
 ├── LICENSE                # MIT
 ├── config.toml.example    # 配置模板（复制成 config.toml 使用）
 ├── ftms_capture.py        # 采集脚本
+├── export_fit.py          # CSV → FIT 导出（自带编码器与校验器）
 └── data/                  # 采集输出（已 gitignore）
 ```
