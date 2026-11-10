@@ -209,7 +209,9 @@ python3 export_fit.py data/ride_20261109_235238.csv -o ~/elliptical.fit
 | | `distance` | `distance_m` |
 | | `resistance` | `resistance_pct`（可用 `--resistance` 换口径） |
 | | `total_cycles` | 步频积分得到的累计步数 |
+| | `accumulated_power` | 功率积分得到的累计值 |
 | | `calories` | 累计卡路里 |
+| | `activity_type` | 由 `--sport` 推导（椭圆机 = 4），COROS 每条 record 都写这个 |
 | `lap` / `session` | `sport=fitness_equipment`、`sub_sport=elliptical` | **这就是「椭圆机」类型** |
 | | 平均/最大 心率、步频、功率、速度 | 按时间加权 |
 | | `total_cycles`、`total_distance`、`total_calories`、`total_work` | 统计 |
@@ -259,6 +261,8 @@ python3 export_fit.py data/ride_20261109_235238.csv -o ~/elliptical.fit
 | `--max-hr-age` | `10` | 心率过期阈值（秒） |
 | `--max-gap` | `10` | 超过该秒数的空档算停顿，不计入计时 |
 | `--device-name` | `ftms_capture` | FIT 里的设备名 |
+| `--manufacturer` | `255` | FIT manufacturer 编号（294 = coros） |
+| `--mimic-coros` | 关 | 伪造 COROS 设备身份，见下 |
 | `--strict` | 关 | 数据有问题时以退出码 2 结束 |
 | `--no-verify` | 关 | 跳过结构自检 |
 
@@ -290,6 +294,28 @@ FIT 的 `record.resistance` 是 uint8，没有单位定义。三个选项：
 生成的 `.fit` 在 COROS App 里走「导入」入口即可（与颂拓记录同样方式）。
 
 **注意**：外部导入的活动不会进入 COROS 的训练负荷/恢复模型，那些只针对手表自己记录的活动。
+
+### `--mimic-coros`：伪装成 COROS 设备
+
+从真实 COROS 活动文件里提取出的身份信息：
+
+| 字段 | 值 |
+|---|---|
+| `file_id.manufacturer` | `294`（coros） |
+| `file_id.product` | `822`（APEX 2 Pro） |
+| `file_id.product_name` | `COROS APEX 2 Pro` |
+| `file_id.serial_number` | **不写**（COROS 自己不写） |
+| `device_info` | 只有 timestamp / manufacturer / product_name 三个字段 |
+| `developer_data_id` | `manufacturer_id=294`，`application_id=[0]×15+[71]` |
+
+```bash
+python3 export_fit.py data/ride_20261109_235238.csv --mimic-coros
+```
+
+**重要：COROS 的 FIT 里没有任何签名、标志位或校验值。** 除标准 FIT CRC 以外
+（而 CRC 我们已经能逐字节复现），文件里没有能证明「这条活动是 COROS 录的」的东西。
+所以这个开关只是把能伪装的元数据都伪装了，**能不能骗过导入管道是另一回事**。
+它的用途是做一个 A/B 对照实验。详见 PROTOCOL.md §13。
 
 ---
 

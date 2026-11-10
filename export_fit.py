@@ -40,6 +40,7 @@ PROFILE_VERSION = 21221  # 21.221.0，与 Garmin 官方 profile 对齐
 BASE_TYPES = {
     "enum": (0x00, 1, 0xFF, "<B"),
     "uint8": (0x02, 1, 0xFF, "<B"),
+    "byte": (0x0D, 1, 0xFF, "<B"),
     "uint16": (0x84, 2, 0xFFFF, "<H"),
     "sint32": (0x85, 4, 0x7FFFFFFF, "<i"),
     "uint32": (0x86, 4, 0xFFFFFFFF, "<I"),
@@ -112,6 +113,9 @@ class FitWriter:
         if base == "string":
             raw = str(value).encode("utf-8")[: size - 1]
             return raw.ljust(size, b"\x00")
+        if base == "byte":
+            raw = bytes(int(b) & 0xFF for b in value)
+            return raw[:size].ljust(size, b"\x00")
         return struct.pack(fmt, int(value))
 
     def tobytes(self) -> bytes:
@@ -137,6 +141,8 @@ MSG_RECORD = 20
 MSG_LAP = 19
 MSG_SESSION = 18
 MSG_ACTIVITY = 34
+MSG_FIELD_DESCRIPTION = 206
+MSG_DEVELOPER_DATA_ID = 207
 
 LOCAL_FILE_ID = 0
 LOCAL_DEVICE_INFO = 1
@@ -145,12 +151,21 @@ LOCAL_RECORD = 3
 LOCAL_LAP = 4
 LOCAL_SESSION = 5
 LOCAL_ACTIVITY = 6
+LOCAL_DEVELOPER_DATA_ID = 7
 
 FIELDS_FILE_ID = [
     _fld(0, "enum"),        # type
     _fld(1, "uint16"),      # manufacturer
     _fld(2, "uint16"),      # product
     _fld(3, "uint32z"),     # serial_number
+    _fld(4, "uint32"),      # time_created
+]
+
+# COROS 自己的 file_id 不写 serial_number
+FIELDS_FILE_ID_COROS = [
+    _fld(0, "enum"),        # type
+    _fld(1, "uint16"),      # manufacturer
+    _fld(2, "uint16"),      # product
     _fld(4, "uint32"),      # time_created
 ]
 
@@ -161,6 +176,13 @@ FIELDS_DEVICE_INFO = [
     _fld(3, "uint32z"),       # serial_number
     _fld(4, "uint16"),        # product
     _fld(5, "uint16"),        # software_version (×100)
+]
+
+# 开发者数据标识（207）。COROS 自己也会写一条，用于声明私有字段的来源厂家。
+FIELDS_DEVELOPER_DATA_ID = [
+    _fld(1, "byte", 16),   # application_id
+    _fld(2, "uint16"),     # manufacturer_id
+    _fld(3, "uint8"),      # developer_data_index
 ]
 
 FIELDS_EVENT = [
@@ -177,11 +199,13 @@ FIELDS_RECORD = [
     _fld(4, "uint8"),     # cadence
     _fld(5, "uint32"),    # distance (×100, m)
     _fld(6, "uint16"),    # speed (×1000, m/s)
+    _fld(73, "uint32"),   # enhanced_speed (×1000, m/s)
     _fld(7, "uint16"),    # power (W)
     _fld(10, "uint8"),    # resistance
     _fld(19, "uint32"),   # total_cycles
+    _fld(29, "uint32"),   # accumulated_power (累计功率，COROS 也写这个)
     _fld(33, "uint16"),   # calories (累计)
-    _fld(73, "uint32"),   # enhanced_speed (×1000, m/s)
+    _fld(42, "enum"),     # activity_type (COROS 每条 record 都写)
 ]
 
 FIELDS_LAP = [
@@ -271,6 +295,15 @@ SESSION_TRIGGER_ACTIVITY_END = 0
 ACTIVITY_TYPE_MANUAL = 0
 
 MANUFACTURER_DEVELOPMENT = 255
+MANUFACTURER_COROS = 294
+
+# COROS 官方文件的身份标识（从真实 FIT 中提取）
+COROS_PRODUCT_APEX2PRO = 822
+COROS_DEVICE_NAME = "COROS APEX 2 Pro"
+COROS_APPLICATION_ID = [0] * 15 + [71]
+
+# FIT record.activity_type 与 sport 共用一套枚举
+ACTIVITY_TYPE_BY_SPORT = {1: 1, 2: 2, 4: 4, 5: 5, 11: 6}
 
 
 # --------------------------------------------------------------------------- #
@@ -612,31 +645,52 @@ def build_fit(
     serial: int,
     device_name: str,
     product: int,
+    manufacturer: int = MANUFACTURER_DEVELOPMENT,
     utc_offset: int = 0,
+    mimic_coros: bool = False,
 ) -> bytes:
     writer = FitWriter()
+
+    start_fit = stats.start_t - FIT_EPOCH_OFFSET
+    end_fit = stats.end_t - FIT_EPOCH_OFFSET
 
     # 字符串字段长度必须是 名称长度 + 1（末尾 \0），与官方编码器保持一致
     name_field = [
         _fld(8, "string", len(device_name) + 1),
     ]
-    file_id_fields = FIELDS_FILE_ID + name_field
-    device_name_field = [_fld(27, "string", len(device_name) + 1)]
-    device_info_fields = FIELDS_DEVICE_INFO + device_name_field
-
-    start_fit = stats.start_t - FIT_EPOCH_OFFSET
-    end_fit = stats.end_t - FIT_EPOCH_OFFSET
+    if mimic_coros:
+        # COROS 自己的 file_id 不写 serial_number，device_info 也只有三个字段
+        file_id_fields = FIELDS_FILE_ID_COROS + name_field
+        file_id_values = [4, manufacturer, product, end_fit, device_name]
+        device_info_fields = [
+            _fld(253, "uint32"),
+            _fld(2, "uint16"),
+            _fld(27, "string", len(device_name) + 1),
+        ]
+        device_info_values = [start_fit, manufacturer, device_name]
+    else:
+        file_id_fields = FIELDS_FILE_ID + name_field
+        file_id_values = [4, manufacturer, product, serial, end_fit, device_name]
+        device_info_fields = FIELDS_DEVICE_INFO + [
+            _fld(27, "string", len(device_name) + 1)
+        ]
+        device_info_values = [
+            start_fit, 0, manufacturer, serial, product, 100, device_name,
+        ]
 
     # --- file_id ---
-    writer.add(
-        LOCAL_FILE_ID, MSG_FILE_ID, file_id_fields,
-        [4, MANUFACTURER_DEVELOPMENT, product, serial, end_fit, device_name],
-    )
+    writer.add(LOCAL_FILE_ID, MSG_FILE_ID, file_id_fields, file_id_values)
+
+    # COROS 会在 file_id 之后立刻跟一条 developer_data_id
+    if mimic_coros:
+        writer.add(
+            LOCAL_DEVELOPER_DATA_ID, MSG_DEVELOPER_DATA_ID, FIELDS_DEVELOPER_DATA_ID,
+            [COROS_APPLICATION_ID, manufacturer, 0],
+        )
 
     # --- device_info（创建者） ---
     writer.add(
-        LOCAL_DEVICE_INFO, MSG_DEVICE_INFO, device_info_fields,
-        [start_fit, 0, MANUFACTURER_DEVELOPMENT, serial, product, 100, device_name],
+        LOCAL_DEVICE_INFO, MSG_DEVICE_INFO, device_info_fields, device_info_values,
     )
 
     # --- 计时开始 ---
@@ -646,7 +700,8 @@ def build_fit(
     )
 
     # --- 逐秒记录 ---
-    def record_values(sample: Sample, steps: float, cumulative_kcal: float) -> list:
+    def record_values(sample: Sample, steps: float, work_j: float,
+                      cumulative_kcal: float, activity_type: int | None) -> list:
         speed_ms = sample.speed_kmh / 3.6 if math.isfinite(sample.speed_kmh) else None
         # 累计卡路里四舍五入后为 0 时不写（FIT 约定 0 就是「无数据」）
         kcal_value = int(round(cumulative_kcal)) or None
@@ -656,11 +711,13 @@ def build_fit(
             _u8(_finite(sample.cadence_spm)),
             _u32(_finite(sample.distance_m), 100),
             _u16(speed_ms, 1000),
+            _u32(speed_ms, 1000),
             _u16(_finite(sample.power_w)),
             _resistance(sample, resistance_mode),
             _u32(steps),
+            _u32(work_j),
             kcal_value,
-            _u32(speed_ms, 1000),
+            activity_type,
         ]
 
     # 记录里填累计卡路里，需要按记录时间点插值出累计值
@@ -673,13 +730,16 @@ def build_fit(
     }[calories]
 
     steps = 0.0
+    record_work = 0.0
     prev_t = samples[0].t
     last_kcal = 0.0
+    activity_type = ACTIVITY_TYPE_BY_SPORT.get(sport)
     for i, sample in enumerate(samples):
         dt = sample.t - prev_t if i else 0.0
         prev_t = sample.t
         if 0 < dt <= 60:
             steps += _zero(sample.cadence_spm) * dt / 60.0
+            record_work += _zero(sample.power_w) * dt
         cumulative = getattr(sample, kcal_column) if kcal_column else 0.0
         if not math.isfinite(cumulative):
             cumulative = last_kcal
@@ -688,7 +748,7 @@ def build_fit(
         last_kcal = cumulative
         writer.add(
             LOCAL_RECORD, MSG_RECORD, FIELDS_RECORD,
-            record_values(sample, steps, cumulative),
+            record_values(sample, steps, record_work, cumulative, activity_type),
         )
 
     # --- 计时结束 ---
@@ -783,7 +843,11 @@ def build_fit(
 # --------------------------------------------------------------------------- #
 
 # 定义字节里的 base type = 类型号 & 0x1F（高位是大小端标志）
-BASE_TYPE_SIZE = {0x00: 1, 0x02: 1, 0x04: 2, 0x05: 4, 0x06: 4, 0x0C: 4, 0x07: 1}
+BASE_TYPE_SIZE = {
+    0x00: 1, 0x01: 1, 0x02: 1, 0x03: 2, 0x04: 2, 0x05: 4, 0x06: 4,
+    0x07: 1, 0x08: 4, 0x09: 8, 0x0A: 1, 0x0B: 2, 0x0C: 4, 0x0D: 1,
+    0x0E: 8, 0x0F: 8, 0x10: 8,
+}
 BASE_TYPE_MASK = 0x1F
 
 def verify_fit(data: bytes) -> list[str]:
@@ -909,15 +973,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="超过该秒数的空档视为停顿，不计入计时",
     )
     parser.add_argument("--device-name", default="ftms_capture", help="FIT 中的设备名")
+    parser.add_argument(
+        "--manufacturer", type=int, default=MANUFACTURER_DEVELOPMENT,
+        help=f"FIT manufacturer 编号（{MANUFACTURER_DEVELOPMENT}=development，"
+             f"{MANUFACTURER_COROS}=coros）",
+    )
     parser.add_argument("--product", type=int, default=1, help="FIT product 编号")
     parser.add_argument("--serial", type=int, help="FIT 序列号（默认由文件名推导）")
+    parser.add_argument(
+        "--mimic-coros", action="store_true",
+        help="伪造 COROS 设备身份（manufacturer=294 / product=822 / 设备名），"
+             "用于测试 COROS 是否把导入活动当作原生记录",
+    )
     parser.add_argument("-q", "--quiet", action="store_true", help="不打印报告")
     parser.add_argument(
-        "--verify", action="store_true", default=True,
-        help="生成后做结构自检（默认开启）",
-    )
-    parser.add_argument(
-        "--no-verify", dest="verify", action="store_false", help="跳过结构自检",
+        "--verify", action=argparse.BooleanOptionalAction, default=True,
+        help="生成后做 FIT 结构自检（不通过则不写盘）",
     )
     parser.add_argument(
         "--strict", action="store_true",
@@ -954,6 +1025,16 @@ def main(argv: list[str] | None = None) -> int:
     stats = compute_stats(samples, args.max_gap, args.calories)
     serial = args.serial if args.serial is not None else zlib.crc32(csv_path.name.encode())
 
+    manufacturer = args.manufacturer
+    product = args.product
+    device_name = args.device_name
+    if args.mimic_coros:
+        manufacturer = MANUFACTURER_COROS
+        if product == 1:
+            product = COROS_PRODUCT_APEX2PRO
+        if device_name == "ftms_capture":
+            device_name = COROS_DEVICE_NAME
+
     fit = build_fit(
         samples, stats,
         sport=args.sport,
@@ -961,9 +1042,11 @@ def main(argv: list[str] | None = None) -> int:
         calories=args.calories,
         resistance_mode=args.resistance,
         serial=serial or 1,
-        device_name=args.device_name,
-        product=args.product,
+        device_name=device_name,
+        product=product,
+        manufacturer=manufacturer,
         utc_offset=local_utc_offset(samples),
+        mimic_coros=args.mimic_coros,
     )
     # 结构自检失败绝不写盘，避免留下坏文件
     problems = verify_fit(fit) if args.verify else []
@@ -1013,6 +1096,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"== 已写入 {out_path}  ({len(fit)} 字节) ==")
         print(f"   sport={args.sport} ({'fitness_equipment' if args.sport == 4 else '自定义'})"
               f"  sub_sport={sub_sport}")
+        if args.mimic_coros:
+            print(f"   身份伪装：manufacturer={manufacturer}(coros) product={product} "
+                  f"device={device_name!r}")
     return 0
 
 
