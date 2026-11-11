@@ -66,6 +66,10 @@ FRAME_LEN = 29
 DISCOVERY_SECONDS = 15.0
 RECONNECT_INTERVAL = 5.0
 
+# 导出 FIT 时的数据清洗阈值（与 export_fit.py 的默认值一致）
+FIT_MAX_HR_AGE = 10.0
+FIT_MAX_GAP = 10.0
+
 # 功率换算成消耗的热量：机械功 / 效率。人踩椭圆机的机械效率约 22–25%，
 # 4.184 kJ/kcal × 0.24 ≈ 1.0，所以工程上「1 kJ 机械功 ≈ 1 kcal 消耗」。
 KCAL_PER_KJ = 1.0
@@ -74,6 +78,15 @@ KCAL_PER_KJ = 1.0
 # --------------------------------------------------------------------------- #
 # 帧解析
 # --------------------------------------------------------------------------- #
+
+def _add_unix_signal(signum: int, handler) -> None:
+    """把 Unix 信号接入 GLib 主循环（GLibUnix 优先，退回旧 API）。"""
+    try:
+        from gi.repository import GLibUnix
+        GLibUnix.signal_add(GLib.PRIORITY_HIGH, signum, handler)
+    except (ImportError, AttributeError):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signum, handler)
+
 
 def _u16(buf: bytes, off: int) -> int:
     return int.from_bytes(buf[off:off + 2], "little")
@@ -606,10 +619,16 @@ class Capture:
                  "stopped": False}
 
         def request_stop(*_a):
-            state["stopped"] = True
+            """Ctrl+C / SIGTERM：立刻退出主循环，交给 finally 收尾。"""
+            if not state["stopped"]:
+                state["stopped"] = True
+                print("\n* 收到中断信号，正在收尾…", flush=True)
+            loop.quit()
+            return GLib.SOURCE_CONTINUE
 
-        signal.signal(signal.SIGINT, request_stop)
-        signal.signal(signal.SIGTERM, request_stop)
+        # 把信号接进 GLib 主循环，避免等 5 秒巡检才响应
+        _add_unix_signal(signal.SIGINT, request_stop)
+        _add_unix_signal(signal.SIGTERM, request_stop)
 
         def supervisor() -> bool:
             if state["stopped"]:
@@ -659,7 +678,72 @@ class Capture:
             if self.hr_frames:
                 msg += f"，心率 {self.hr_frames} 帧"
             print(f"{msg} -> {self.csv_path}", flush=True)
+            self.write_fit()
         return 0
+
+    # -- 收尾：生成 FIT ------------------------------------------------------ #
+
+    def write_fit(self) -> None:
+        """把刚写完的 CSV 转成 FIT。任何失败都只警告，不影响采集结果。"""
+        if not self.args.fit:
+            return
+
+        try:
+            import zlib
+            from pathlib import Path
+
+            import export_fit as ef
+        except Exception as exc:                     # 文件缺失 / 语法错误
+            print(f"! 无法加载 export_fit.py，跳过 FIT 生成: {exc}", file=sys.stderr)
+            return
+
+        csv_path = Path(self.csv_path)
+        try:
+            issues = ef.Issues()
+            samples = ef.load_samples(csv_path, issues, FIT_MAX_HR_AGE)
+            if len(samples) < 2:
+                print(f"! 有效样本只有 {len(samples)} 条，未生成 FIT", file=sys.stderr)
+                return
+
+            stats = ef.compute_stats(samples, FIT_MAX_GAP, self.args.fit_calories)
+            fit_bytes = ef.build_fit(
+                samples, stats,
+                sport=ef.SPORT_FITNESS_EQUIPMENT,
+                sub_sport=ef.SUB_SPORT_ELLIPTICAL,
+                calories=self.args.fit_calories,
+                resistance_mode=self.args.fit_resistance,
+                serial=zlib.crc32(csv_path.name.encode()) or 1,
+                device_name="ftms_capture",
+                product=1,
+                utc_offset=ef.local_utc_offset(samples),
+            )
+
+            problems = ef.verify_fit(fit_bytes)
+            if problems:
+                print("! FIT 结构自检未通过，未写出：", file=sys.stderr)
+                for problem in problems:
+                    print(f"    ✗ {problem}", file=sys.stderr)
+                return
+
+            out_path = csv_path.with_suffix(".fit")
+            out_path.write_bytes(fit_bytes)
+        except Exception as exc:                     # 绝不让收尾打断采集结果
+            print(f"! 生成 FIT 失败: {exc}", file=sys.stderr)
+            return
+
+        print(f"* FIT  {out_path}  ({len(fit_bytes)} 字节)", flush=True)
+        if stats.avg_hr is not None:
+            print(f"   椭圆机 · {stats.timer_s:.0f}s · {stats.distance_m:.0f} m"
+                  f" · 心率均 {stats.avg_hr:.0f} bpm", flush=True)
+        else:
+            print(f"   椭圆机 · {stats.timer_s:.0f}s · {stats.distance_m:.0f} m"
+                  f" · 无心率数据", flush=True)
+        dropped = dict(issues.dropped)
+        if issues.hr_dropped:
+            dropped["心率"] = issues.hr_dropped
+        if dropped:
+            detail = "，".join(f"{k} × {v}" for k, v in dropped.items())
+            print(f"   数据清洗：{detail}", flush=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -722,13 +806,15 @@ DEFAULTS = {
     "duration": 0.0, "scan_timeout": DISCOVERY_SECONDS,
     "outdir": "data", "prefix": "ride",
     "jsonl": False, "quiet": False,
+    "fit": True, "fit_calories": "keytel_net", "fit_resistance": "percent",
 }
 
 # 配置文件里各个 section 能覆盖的键
 CONFIG_SECTIONS = {
     "device": ("address", "name", "hr", "hr_name"),
     "profile": ("age", "weight", "sex"),
-    "output": ("outdir", "prefix", "jsonl", "quiet", "duration"),
+    "output": ("outdir", "prefix", "jsonl", "quiet", "duration",
+               "fit", "fit_calories", "fit_resistance"),
 }
 
 
@@ -792,6 +878,14 @@ def parse_args(argv=None):
                    help="额外输出原始帧 jsonl")
     o.add_argument("--quiet", action="store_true", default=None,
                    help="不打印实时行")
+    o.add_argument("--fit", action=argparse.BooleanOptionalAction, default=None,
+                   help="结束时自动生成 FIT 活动文件（默认开启）")
+    o.add_argument("--fit-calories", default=None,
+                   choices=["power", "keytel", "keytel_net", "machine", "none"],
+                   help="FIT 里的卡路里用哪一路（默认 keytel_net）")
+    o.add_argument("--fit-resistance", default=None,
+                   choices=["percent", "raw", "turns"],
+                   help="FIT 里 resistance 字段写哪个量（默认 percent）")
 
     args = p.parse_args(argv)
 

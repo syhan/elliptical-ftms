@@ -129,6 +129,9 @@ python3 ftms_capture.py --config config.toml --hr ""
 | `--jsonl` | 关 | 额外把原始帧写成 jsonl，便于事后重新解析 |
 | `--quiet` | 关 | 不在终端打印实时行 |
 | `--scan-timeout SEC` | `15` | 扫描等待时间 |
+| `--fit` / `--no-fit` | 开 | 结束时自动生成 FIT |
+| `--fit-calories` | `keytel_net` | FIT 里的卡路里用哪一路 |
+| `--fit-resistance` | `percent` | FIT 里 resistance 写哪个量 |
 
 `--address` 和 `--name` 都不给时，会自动选中第一个广播里带 `0x1826` 的设备。
 
@@ -136,11 +139,12 @@ python3 ftms_capture.py --config config.toml --hr ""
 
 ## 输出
 
-每次采集产出 2–3 个文件：
+每次采集产出 3–4 个文件：
 
 | 文件 | 内容 |
 |---|---|
 | `ride_<stamp>.csv` | 逐秒合并行：FTMS 字段 + 最近一次心率 |
+| `ride_<stamp>.fit` | **可导入 COROS 的活动文件**（结束时自动生成） |
 | `ride_<stamp>.jsonl` | 原始 `0x2ACE` 帧（`--jsonl` 时） |
 | `ride_<stamp>_hr.jsonl` | 原始心率帧，1 Hz 全量，含 RR/接触标志 |
 
@@ -183,8 +187,34 @@ python3 ftms_capture.py --config config.toml --hr ""
 
 ## 导出 FIT
 
-采集完的 CSV 可以转成标准 FIT 活动文件，直接导入 COROS / Strava / Garmin Connect
-/ Intervals.icu。`export_fit.py` **不依赖任何第三方库**，自带 FIT 编码器与校验器。
+**采集结束时（Ctrl+C 或到达 `--duration`）会自动生成同名 `.fit`，不需要额外操作。**
+
+```
+$ python3 ftms_capture.py --config config.toml
+…
+^C
+* 收到中断信号，正在收尾…
+* 结束，FTMS 1180 帧，心率 1195 帧 -> data/ride_20261112_200312.csv
+* FIT  data/ride_20261112_200312.fit  (38241 字节)
+   椭圆机 · 1198s · 3210 m · 心率均 128 bpm
+```
+
+一次踩踏产出三个文件：
+
+```
+data/ride_20261112_200312.csv    ← 逐秒原始数据
+data/ride_20261112_200312.fit    ← 可直接导入 COROS
+data/ride_20261112_200312.jsonl  ← 原始帧（--jsonl 时）
+```
+
+Ctrl+C 会**立即**响应（信号接进了 GLib 主循环，不用等 5 秒巡检），
+收尾阶段平均 0.3 秒完成。
+
+如果只想拿到 CSV 不要 FIT，加 `--no-fit`，或在 `config.toml` 里设 `fit = false`。
+
+### 手动导出
+
+想改口径重新导一次，或者导旧文件：
 
 ```bash
 # 最简：生成同名 .fit

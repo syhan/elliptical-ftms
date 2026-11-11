@@ -30,3 +30,14 @@ outdir = "data"
 prefix = "ride"
 jsonl = true       # 额外保存原始 0x2ACE 帧
 quiet = false      # true 则不打印每秒实时行
+
+# 采集结束后（Ctrl+C 或到达时长）自动把 CSV 转成 FIT 活动文件。
+# 运动类型固定写成「椭圆机」（sport=fitness_equipment / sub_sport=elliptical），
+# 可以直接导入 COROS。
+fit = true
+
+# FIT 里的卡路里用哪一路：power / keytel / keytel_net / machine / none
+fit_calories = "keytel_net"
+
+# FIT 里 resistance 字段写哪个量：percent（0-100）/ raw（0-91）/ turns（圈数）
+fit_resistance = "percent"
