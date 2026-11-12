@@ -504,9 +504,11 @@ def render_full(snap: dict, cols: int, rows: int, color: bool = True) -> list[st
     title = snap["device"] or "FTMS"
     if snap["session"]:
         title += f"  ·  {snap['session']}"
-    clock_txt = time.strftime("%H:%M:%S")
+    wall = time.strftime("%H:%M:%S")
+    date = time.strftime("%m-%d")
     status_txt = paint(status, scolor) if color else status
-    out = [_titled(cols, title, f"{status_txt} {clock_txt}")]
+    wall_txt = paint(wall, "bold", "white") if color else wall
+    out = [_titled(cols, title, f"{date} {wall_txt} {status_txt}")]
     inner = cols - 2
 
     clock = _fmt_clock(snap["elapsed"])
@@ -529,10 +531,18 @@ def render_full(snap: dict, cols: int, rows: int, color: bool = True) -> list[st
     band3 = [
         {"label": "距离", "value": str(snap["distance"]), "unit": "m",
          "style": "blue"},
-        {"label": "时间", "value": clock, "unit": "", "style": "white",
-         "fallback": minutes},
+        {"label": "均速", "value": f"{snap['avg_speed']:.2f}", "unit": "km/h",
+         "style": "cyan"},
         {"label": "消耗", "value": f"{snap['kcal']:.0f}", "unit": "kcal",
          "style": "red"},
+    ]
+    # 屏幕够高才有第四排：墙上时钟 + 用时。
+    # 只放两格，这样 HH:MM:SS 的大字（40 列）能完整显示，不会被砍掉秒。
+    band4 = [
+        {"label": "现在", "value": wall, "unit": "", "style": "white",
+         "fallback": wall[:5]},
+        {"label": "用时", "value": clock, "unit": "", "style": "white",
+         "fallback": minutes},
     ]
 
     bands = [band1]
@@ -540,6 +550,8 @@ def render_full(snap: dict, cols: int, rows: int, color: bool = True) -> list[st
         bands.append(band2)
     if rows >= 23:
         bands.append(band3)
+    if rows >= 29:
+        bands.append(band4)
 
     for index, band in enumerate(bands):
         if index:
