@@ -124,7 +124,7 @@ BIG_FONT = {
     "7": ("████", "   █", "   █", "   █", "   █"),
     "8": ("████", "█  █", "████", "█  █", "████"),
     "9": ("████", "█  █", "████", "   █", "████"),
-    ".": ("    ", "    ", "    ", "    ", " ██ "),
+    ".": ("    ", "    ", "    ", "    ", "██  "),
     "-": ("    ", "    ", "████", "    ", "    "),
     " ": ("    ", "    ", "    ", "    ", "    "),
 }
@@ -133,14 +133,22 @@ BIG_ROWS = 5
 BIG_COLS = 4
 
 
+BIG_GAP = 1          # 字间留白，否则小数点会和相邻数字粘在一起
+
+
 def big(text: str) -> list[str]:
-    """把字符串渲染成 5 行大字。"""
+    """把字符串渲染成 5 行大字，每个字符之间留 BIG_GAP 列。"""
     rows = ["", "", "", "", ""]
+    pad = " " * BIG_GAP
     for ch in text:
         glyph = BIG_FONT.get(ch, BIG_FONT[" "])
         for i in range(BIG_ROWS):
-            rows[i] += glyph[i]
+            rows[i] += glyph[i] + pad
     return rows
+
+
+def big_width(text: str) -> int:
+    return len(text) * (BIG_COLS + BIG_GAP)
 
 
 # --------------------------------------------------------------------------- #
@@ -678,12 +686,15 @@ class TuiServer:
         term = TermInfo()
         try:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            conn.sendall(b"\x1b[?1049h\x1b[?25l\x1b[2J" + SIZE_QUERY)
+            # 顺序很重要：先进备用屏，再发 telnet 协商（nc 会把它当乱码画出来），
+            # 然后 2J 清掉，最后查尺寸。这样 nc 看不到任何伤痕。
+            conn.sendall(b"\x1b[?1049h" + term.telnet_handshake()
+                         + b"\x1b[2J\x1b[?25l" + SIZE_QUERY)
             last_render = 0.0
             last_query = time.monotonic()
             last_ver = -1
             # 先给 200ms 收集尺寸回报，拿不到就用默认值
-            deadline = time.monotonic() + 0.2
+            deadline = time.monotonic() + 0.6
             while time.monotonic() < deadline and not term.size_known:
                 if not self._poll(conn, term, 0.05):
                     return
@@ -736,13 +747,7 @@ class TuiServer:
         if not data:
             return False
 
-        was_telnet = term.is_telnet
         keys = term.feed(data)
-        if term.is_telnet and not was_telnet:
-            try:
-                conn.sendall(term.telnet_handshake())
-            except OSError:
-                return False
         if b"q" in keys.lower() or b"\x03" in keys or b"\x1b" == keys[:1]:
             return False
         return True

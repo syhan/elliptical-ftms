@@ -778,12 +778,18 @@ class Capture:
     def _capture_loop(self, deadline: float | None = None,
                       idle_timeout: float | None = None,
                       disconnect_after: float | None = None) -> int:
+        if self.args.hr or self.args.hr_name or getattr(self.args, "hr_any", False):
+            # 血泪教训：找到椭圆机后 AutoRunner 会停掉 discovery，这时如果手表
+            # 才打开心率广播，BlueZ 根本看不到它，界面就永远没有心率。
+            self.bz.start_discovery()
+
         loop = GLib.MainLoop()
         self._loop = loop
         state = {
             "deadline": time.time() + deadline if deadline else None,
             "next_connect": 0.0,
             "hr_next": 0.0,
+            "hr_warned": False,
         }
 
         def end(reason: str) -> None:
@@ -850,7 +856,11 @@ class Capture:
                         self.hr_connected = False
                 elif now_mono >= state["hr_next"]:
                     state["hr_next"] = now_mono + RECONNECT_INTERVAL
-                    self.attach_hr()
+                    if not self.attach_hr() and not state["hr_warned"]:
+                        state["hr_warned"] = True
+                        print("* 还没发现心率广播，每 "
+                              f"{RECONNECT_INTERVAL:.0f}s 再找一次"
+                              "（手表上要打开「心率广播」）", flush=True)
             return True
 
         GLib.timeout_add_seconds(1, supervisor)
@@ -1038,34 +1048,49 @@ class AutoRunner:
     # -- 等设备 ------------------------------------------------------------- #
 
     def wait_for_device(self):
-        """等一台 FTMS 椭圆机出现，返回 (path, props)；被中断则返回 None。"""
+        """等一台 FTMS 椭圆机出现，返回 (path, props)；被中断则返回 None。
+
+        必须跑在 GLib 主循环里，不能用 while+sleep：信号是经 GLibUnix 接进来
+        的，主循环不转就收不到 SIGTERM —— 表现为等待设备期间 systemctl stop
+        要空等到 TimeoutStopSec 才被 SIGKILL。
+        """
         self.bz.start_discovery()
         label = (self.args.address
                  or (f"name~{self.args.name}" if self.args.name else "任意 FTMS 设备"))
         print(f"* 等待椭圆机广播（{label}）…", flush=True)
 
-        last_beat = last_check = time.monotonic()
-        while not _stop_requested():
-            found = self._candidate()
-            if found:
-                self.bz.stop_discovery()
-                return found
+        loop = GLib.MainLoop()
+        found: dict = {"dev": None}
+        state = {"beat": time.monotonic(), "check": time.monotonic()}
+
+        def tick() -> bool:
+            if _stop_requested():
+                loop.quit()
+                return False
+
+            device = self._candidate()
+            if device:
+                found["dev"] = device
+                loop.quit()
+                return False
 
             now = time.monotonic()
-            if now - last_check > 5.0:            # BlueZ 偶尔会自己停掉 discovery
-                last_check = now
+            if now - state["check"] > 5.0:        # BlueZ 偶尔会自己停掉 discovery
+                state["check"] = now
                 for path, _ in self.bz.adapters():
                     props = self.bz.properties(path, ADAPTER_IFACE)
                     if props and not props.get("Discovering"):
                         self.bz.start_discovery()
                     break
-            if now - last_beat > 300:             # 五分钟报一次平安
-                last_beat = now
+            if now - state["beat"] > 300:         # 五分钟报一次平安
+                state["beat"] = now
                 print(f"* 仍在等待… {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
-            time.sleep(0.5)
+            return True
 
+        GLib.timeout_add(500, tick)
+        _run_loop(loop)
         self.bz.stop_discovery()
-        return None
+        return found["dev"]
 
     # -- 主循环 ------------------------------------------------------------- #
 
