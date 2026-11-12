@@ -4,6 +4,8 @@ Documentation=https://github.com/syhan/elliptical-ftms
 # bluetooth.target 在 bluez 装上后才有
 Wants=bluetooth.target
 After=bluetooth.target
+# 永不进入「启动太频繁，放弃重启」状态
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -14,7 +16,6 @@ Environment=PYTHONUNBUFFERED=1
 # 踩完一局就退出说明出了大问题（蓝牙假死之类），重启它
 Restart=on-failure
 RestartSec=15
-StartLimitIntervalSec=0
 
 # SIGTERM 会触发收尾：写 FIT 再退出，别急着 SIGKILL
 KillSignal=SIGTERM
