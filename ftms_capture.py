@@ -435,8 +435,11 @@ class Capture:
         self.mqtt_topic = (getattr(args, "mqtt_topic", "") or "elliptical").rstrip("/")
         self._loop: GLib.MainLoop | None = None
 
-        # 通知回调必须挂在全局 bus 上，只需要注册一次
-        bluez.bus.signal_subscribe(
+        # 通知回调挂在全局 bus 上。注意必须保存订阅 id 并在收尾时退订，
+        # 否则每开一局就泄漏一个回调：旧 Capture 会被新会话的主循环继续驱动，
+        # 表现为日志里同一个「面板归零」每秒重复 N 次。
+        self.closed = False
+        self.sub_id = bluez.bus.signal_subscribe(
             BLUEZ, PROPERTIES, "PropertiesChanged", None, None,
             Gio.DBusSignalFlags.NONE, self._on_properties_changed,
         )
@@ -513,7 +516,7 @@ class Capture:
                                params, _data=None):
         # GDBus 回调签名: (conn, sender, path, iface, signal_name, params, user_data)
         # 注意 params 是 GLib.Variant（支持下标协议），不是 Python tuple
-        if iface != PROPERTIES:
+        if iface != PROPERTIES or self.closed:
             return
         try:
             changed = params[1]
@@ -553,8 +556,9 @@ class Capture:
                        and frame.elapsed_s + 5 < prev_elapsed)
 
         if panel_reset and self.auto_mode:
-            # 守护模式：归零这一帧属于下一局，不计数、不写行，直接收尾。
+            # 守护模式：归零这一帧属于下一局，不计数、不写行。
             # （单次模式仍会把它写进去，好让 export_fit 的 --on-reset 有据可依）
+            self.last_elapsed = frame.elapsed_s       # 先更新，避免反复触发
             self.end_reason = "面板清零"
             print(f"\n* 面板计时器归零（{prev_elapsed}s → {frame.elapsed_s}s），本局结束",
                   flush=True)
@@ -669,6 +673,8 @@ class Capture:
     # -- 椭圆机连接 --------------------------------------------------------- #
 
     def attach(self) -> bool:
+        if self.connected and self.subscribed:
+            return True
         found = self.bz.find(self.args.address, self.args.name)
         if not found:
             return False
@@ -789,13 +795,19 @@ class Capture:
 
             now_mono = time.monotonic()
 
-            # 掉线判定：BTL 链路断了基本就是面板关机 / 走远
+            # 掉线判定：BLE 链路断了基本就是面板关机 / 走远。
+            # 连续两次读到未连接才算数 —— 刚连上时偶有瞬时读数把连接判死，
+            # 那会导致每秒重连一次。
             if self.connected:
                 props = self.bz.properties(self.device_path, DEVICE_IFACE)
-                if props and not props.get("Connected"):
-                    print("* 椭圆机连接断开，尝试重连…", flush=True)
-                    self.connected = False
-                    self.disconnected_since = now_mono
+                if props and props.get("Connected") is False:
+                    state["disc_hits"] = state.get("disc_hits", 0) + 1
+                    if state["disc_hits"] >= 2:
+                        print("* 椭圆机连接断开，尝试重连…", flush=True)
+                        self.connected = False
+                        self.disconnected_since = now_mono
+                else:
+                    state["disc_hits"] = 0
             if self.connected:
                 self.disconnected_since = None
             elif (disconnect_after and self.disconnected_since
@@ -845,6 +857,13 @@ class Capture:
         return 0
 
     def _shutdown(self) -> None:
+        self.closed = True
+        if self.sub_id:
+            try:
+                self.bz.bus.signal_unsubscribe(self.sub_id)
+            except Exception:
+                pass
+            self.sub_id = 0
         self.detach()
         self.detach_hr()
         if self.device_path:
