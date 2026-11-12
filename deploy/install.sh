@@ -66,15 +66,20 @@ if [ "$WITH_MQTT" = "1" ]; then
     say "3b/6 配置局域网 MQTT broker"
     sudo install -m 644 "$DIR/deploy/mosquitto-elliptical.conf" \
         /etc/mosquitto/conf.d/elliptical.conf
-    sudo systemctl enable --now mosquitto
+    # 注意：apt install 的 postinst 已经把 mosquitto 起来了，
+    # 这里必须 restart 才会读到刚写进去的 conf.d 配置
+    sudo systemctl enable mosquitto
+    sudo systemctl restart mosquitto
     if systemctl is-active --quiet ufw; then
         sudo ufw allow 1883/tcp >/dev/null
         echo "  ufw: 已放行 1883/tcp"
     fi
     sleep 1
-    sudo ss -lntp | grep -q ':1883' \
-        && echo "  mosquitto 正在 1883 监听" \
-        || echo "  ! 1883 没有监听，看 journalctl -u mosquitto" >&2
+    if sudo ss -lnt | grep -q '0\.0\.0\.0:1883\|\*:1883\|\[::\]:1883'; then
+        echo "  mosquitto 正在 1883 监听（局域网可访问）"
+    else
+        echo "  ! 1883 只监听了 localhost，检查 /etc/mosquitto/conf.d/elliptical.conf" >&2
+    fi
 fi
 
 say "4/6 取仓库"
