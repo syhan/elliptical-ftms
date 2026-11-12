@@ -405,7 +405,7 @@ def render_medium(snap: dict, cols: int, rows: int, color: bool = True) -> list[
 
     # 剩下的空间给迷你图
     left_rows = max(0, rows - len(out) - 1)
-    if left_rows > 0:
+    if left_rows > 0 and snap["hist_speed"]:
         speed_line = _spark(snap["hist_speed"], inner - 8)
         out.append(_row(" 速度 " + (paint(speed_line, "cyan") if color else speed_line), cols))
         left_rows -= 1
