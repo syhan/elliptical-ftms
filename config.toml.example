@@ -81,3 +81,11 @@ mqtt_password = ""
 # 额外发布 Home Assistant 自动发现配置
 mqtt_ha = false
 mqtt_debug = false
+
+[tui]
+# 网络 TUI：nc / telnet 连进来就能看实时数据。
+#   nc 10.0.0.177 2323
+# port = 0 表示关闭。监听地址填 127.0.0.1 则只允许本机连。
+tui_host = "0.0.0.0"
+tui_port = 0
+tui_color = true

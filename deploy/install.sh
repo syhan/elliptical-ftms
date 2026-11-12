@@ -15,6 +15,8 @@ set -euo pipefail
 REPO="${REPO:-https://github.com/syhan/elliptical-ftms.git}"
 DIR="${DIR:-$HOME/elliptical-ftms}"
 WITH_MQTT="${WITH_MQTT:-1}"
+WITH_TUI="${WITH_TUI:-1}"
+TUI_PORT="${TUI_PORT:-2323}"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
@@ -70,10 +72,15 @@ if [ "$WITH_MQTT" = "1" ]; then
     # 这里必须 restart 才会读到刚写进去的 conf.d 配置
     sudo systemctl enable mosquitto
     sudo systemctl restart mosquitto
-    if systemctl is-active --quiet ufw; then
-        sudo ufw allow 1883/tcp >/dev/null
-        echo "  ufw: 已放行 1883/tcp"
-    fi
+fi
+
+if systemctl is-active --quiet ufw; then
+    [ "$WITH_MQTT" = "1" ] && sudo ufw allow 1883/tcp >/dev/null
+    [ "$WITH_TUI" = "1" ] && sudo ufw allow "$TUI_PORT"/tcp >/dev/null
+    echo "  ufw: 已放行 1883/tcp 与 $TUI_PORT/tcp"
+fi
+
+if [ "$WITH_MQTT" = "1" ]; then
     sleep 1
     if sudo ss -lnt | grep -q '0\.0\.0\.0:1883\|\*:1883\|\[::\]:1883'; then
         echo "  mosquitto 正在 1883 监听（局域网可访问）"

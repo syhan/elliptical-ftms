@@ -33,6 +33,8 @@ try:
 except ModuleNotFoundError:          # Python < 3.11
     tomllib = None
 
+import ftms_tui
+
 import gi
 
 gi.require_version("Gio", "2.0")
@@ -621,6 +623,9 @@ class Capture:
         self.writer.writerow(row)
         self.csv_file.flush()
 
+        ftms_tui.LIVE.update_ftms(frame, self.hr_bpm or 0,
+                                  self.kcal_keytel_net,
+                                  started=self.started, session=self.stamp)
         if self.mqtt:
             self.publish_state(frame)
 
@@ -658,6 +663,7 @@ class Capture:
         self.hr_bpm = sample.bpm
         self.hr_ts = time.time()
         self.hr_contact = sample.contact
+        ftms_tui.LIVE.update_hr(sample.bpm)
 
         if self.hr_jsonl_file:
             self.hr_jsonl_file.write(json.dumps({
@@ -690,6 +696,8 @@ class Capture:
 
         self.device_path = path
         self.connected = True
+        ftms_tui.LIVE.set_device(
+            props.get("Name") or props.get("Alias") or props.get("Address") or "")
 
         chars = self.bz.characteristics(path)
         target = chars.get(CROSS_TRAINER_DATA)
@@ -858,6 +866,7 @@ class Capture:
 
     def _shutdown(self) -> None:
         self.closed = True
+        ftms_tui.LIVE.set_idle()
         if self.sub_id:
             try:
                 self.bz.bus.signal_unsubscribe(self.sub_id)
@@ -1186,6 +1195,8 @@ DEFAULTS = {
     "mqtt_client_id": "elliptical-ftms",
     "mqtt_user": "", "mqtt_password": "",
     "mqtt_ha": False, "mqtt_debug": False,
+    # 网络 TUI
+    "tui_host": "0.0.0.0", "tui_port": 0, "tui_color": True,
 }
 
 # 配置文件里各个 section 能覆盖的键
@@ -1198,6 +1209,7 @@ CONFIG_SECTIONS = {
              "auto_min_frames", "auto_start_on", "auto_cooldown"),
     "mqtt": ("mqtt_host", "mqtt_port", "mqtt_topic", "mqtt_client_id",
              "mqtt_user", "mqtt_password", "mqtt_ha", "mqtt_debug"),
+    "tui": ("tui_host", "tui_port", "tui_color"),
 }
 
 
@@ -1302,6 +1314,14 @@ def parse_args(argv=None):
     m.add_argument("--mqtt-debug", action="store_true", default=None,
                    help="打印 MQTT 连接日志")
 
+    t = p.add_argument_group("网络 TUI（nc / telnet）")
+    t.add_argument("--tui-port", type=int, default=None,
+                   help="监听端口，0 = 关闭（默认）。例：2323")
+    t.add_argument("--tui-host", default=None,
+                   help="监听地址（默认 0.0.0.0，只给本机用就填 127.0.0.1）")
+    t.add_argument("--tui-color", action=argparse.BooleanOptionalAction, default=None,
+                   help="彩色输出（默认开）")
+
     args = p.parse_args(argv)
 
     # 三层合并：默认值 <- 配置文件 <- 命令行
@@ -1352,13 +1372,29 @@ def main(argv=None) -> int:
         print(f"* 心率   {hrs or '不采集'}", flush=True)
         print(f"* 个人参数 {prof}", flush=True)
 
+    tui_server = None
+    if args.tui_port:
+        try:
+            tui_server = ftms_tui.TuiServer(
+                ftms_tui.LIVE, args.tui_host, args.tui_port,
+                color=args.tui_color).start()
+            print(f"* TUI   {args.tui_host}:{args.tui_port}"
+                  f"   nc <这台机器的IP> {args.tui_port}", flush=True)
+        except OSError as exc:
+            print(f"! TUI 端口 {args.tui_port} 起不来: {exc}", file=sys.stderr)
+
+    def _finish(code: int) -> int:
+        if tui_server:
+            tui_server.stop()
+        return code
+
     if args.auto:
         if args.duration:
             print("! 守护模式下 --duration 不生效（每局由信号决定）",
                   file=sys.stderr)
-        return AutoRunner(bluez, args).run()
+        return _finish(AutoRunner(bluez, args).run())
 
-    return Capture(bluez, args).run()
+    return _finish(Capture(bluez, args).run())
 
 
 if __name__ == "__main__":
