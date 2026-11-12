@@ -1,0 +1,26 @@
+[Unit]
+Description=Elliptical FTMS 采集守护（YESOUL EF25 + BLE 心率）
+Documentation=https://github.com/syhan/elliptical-ftms
+# bluetooth.target 在 bluez 装上后才有
+Wants=bluetooth.target
+After=bluetooth.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/elliptical-ftms
+ExecStart=/usr/bin/python3 %h/elliptical-ftms/ftms_capture.py \
+    --config %h/elliptical-ftms/config.toml --auto
+# 输出重定向到日志，方便 journalctl 之外直接 tail
+Environment=PYTHONUNBUFFERED=1
+
+# 踩完一局就退出说明出了大问题（蓝牙假死之类），重启它
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=0
+
+# SIGTERM 会触发收尾：写 FIT 再退出，别急着 SIGKILL
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

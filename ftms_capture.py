@@ -88,6 +88,43 @@ def _add_unix_signal(signum: int, handler) -> None:
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signum, handler)
 
 
+# 守护模式下会反复进出主循环，信号只接一次，靠这份共享状态传递“该停了”
+_STOP = {"requested": False, "loop": None, "installed": False}
+
+
+def _install_signals() -> None:
+    """Ctrl+C / SIGTERM → 设标志 + 唤醒当前主循环（可重复调用）。"""
+    if _STOP["installed"]:
+        return
+
+    def handler(*_a):
+        if not _STOP["requested"]:
+            _STOP["requested"] = True
+        loop = _STOP["loop"]
+        if loop is not None and loop.is_running():
+            loop.quit()
+        return GLib.SOURCE_CONTINUE
+
+    _add_unix_signal(signal.SIGINT, handler)
+    _add_unix_signal(signal.SIGTERM, handler)
+    _STOP["installed"] = True
+
+
+def _stop_requested() -> bool:
+    return _STOP["requested"]
+
+
+def _run_loop(loop: GLib.MainLoop) -> None:
+    """跑主循环；如果信号已先到，立即返回（不复位标志）。"""
+    if _STOP["requested"]:
+        return
+    _STOP["loop"] = loop
+    try:
+        loop.run()
+    finally:
+        _STOP["loop"] = None
+
+
 def _u16(buf: bytes, off: int) -> int:
     return int.from_bytes(buf[off:off + 2], "little")
 
@@ -353,6 +390,8 @@ class Capture:
         self.frames = 0
         self.last: Frame | None = None
         self.last_elapsed: int | None = None
+        self.last_frame_mono: float | None = None
+        self.disconnected_since: float | None = None
 
         # 心率
         self.hr_path: str | None = None
@@ -372,31 +411,101 @@ class Capture:
         self.kcal_keytel_net = 0.0
         self._last_tick: float | None = None
 
+        # 输出文件延迟到「真正开始」时才创建。守护模式下设备可能先广播、
+        # 然后闲置五分钟才清零关机，那种空会话不该在磁盘上留下垃圾。
         os.makedirs(args.outdir, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        self.csv_path = os.path.join(args.outdir, f"{args.prefix}_{stamp}.csv")
-        self.csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
-        self.writer = csv.DictWriter(self.csv_file, fieldnames=CSV_COLUMNS)
-        self.writer.writeheader()
-
+        self.stamp = time.strftime("%Y%m%d_%H%M%S")
+        self.csv_path = os.path.join(args.outdir, f"{args.prefix}_{self.stamp}.csv")
+        self.jsonl_path = os.path.join(args.outdir, f"{args.prefix}_{self.stamp}.jsonl")
+        self.hr_jsonl_path = os.path.join(args.outdir,
+                                          f"{args.prefix}_{self.stamp}_hr.jsonl")
+        self.csv_file = None
+        self.writer = None
         self.jsonl_file = None
-        self.jsonl_path = ""
-        if args.jsonl:
-            self.jsonl_path = os.path.join(args.outdir, f"{args.prefix}_{stamp}.jsonl")
-            self.jsonl_file = open(self.jsonl_path, "w", encoding="utf-8")
-
         self.hr_jsonl_file = None
-        self.hr_jsonl_path = ""
-        if args.hr or args.hr_name:
-            self.hr_jsonl_path = os.path.join(args.outdir,
-                                              f"{args.prefix}_{stamp}_hr.jsonl")
-            self.hr_jsonl_file = open(self.hr_jsonl_path, "w", encoding="utf-8")
+        self.files_open = False
+
+        # 会话状态
+        self.started = False
+        self.auto_mode = False
+        self.session_no = 0
+        self.end_reason = ""
+        self.start_mode = getattr(args, "auto_start_on", "") or "signal"
+        self.mqtt = None
+        self.mqtt_topic = (getattr(args, "mqtt_topic", "") or "elliptical").rstrip("/")
+        self._loop: GLib.MainLoop | None = None
 
         # 通知回调必须挂在全局 bus 上，只需要注册一次
         bluez.bus.signal_subscribe(
             BLUEZ, PROPERTIES, "PropertiesChanged", None, None,
             Gio.DBusSignalFlags.NONE, self._on_properties_changed,
         )
+
+    # -- 文件 --------------------------------------------------------------- #
+
+    def open_files(self) -> None:
+        if self.files_open:
+            return
+        self.csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
+        self.writer = csv.DictWriter(self.csv_file, fieldnames=CSV_COLUMNS)
+        self.writer.writeheader()
+        self.csv_file.flush()
+        self.files_open = True
+
+        if self.args.jsonl:
+            self.jsonl_file = open(self.jsonl_path, "w", encoding="utf-8")
+        if self.args.hr or getattr(self.args, "hr_any", False):
+            self.hr_jsonl_file = open(self.hr_jsonl_path, "w", encoding="utf-8")
+
+    def close_files(self) -> None:
+        for fh in (self.csv_file, self.jsonl_file, self.hr_jsonl_file):
+            if fh:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+        self.csv_file = None
+        self.writer = None
+        self.jsonl_file = None
+        self.hr_jsonl_file = None
+
+    def ensure_started(self) -> None:
+        """建文件、打日志、发 MQTT start。重复调用无副作用。"""
+        if self.started:
+            return
+        self.started = True
+        self.open_files()
+        print(f"* 开始记录 {self.csv_path}", flush=True)
+        if self.jsonl_file:
+            print(f"* 原始帧 {self.jsonl_path}", flush=True)
+        if self.hr_jsonl_file:
+            print(f"* 心率帧 {self.hr_jsonl_path}", flush=True)
+        if self.mqtt:
+            self.mqtt.publish_json(f"{self.mqtt_topic}/session", {
+                "event": "start",
+                "session": self.stamp,
+                "session_no": self.session_no,
+                "device": self.args.address or self.args.name,
+            })
+
+    # -- MQTT --------------------------------------------------------------- #
+
+    def publish_state(self, frame: Frame) -> None:
+        if not self.mqtt:
+            return
+        self.mqtt.publish_json(f"{self.mqtt_topic}/state", {
+            "ts": self.stamp,
+            "elapsed": frame.elapsed_s,
+            "speed": round(frame.speed_kmh, 2),
+            "cadence": frame.cadence_spm,
+            "power": frame.power_w,
+            "resistance": round(frame.resistance_pct, 1),
+            "resistance_raw": round(frame.resistance_raw, 1),
+            "distance": frame.distance_m,
+            "hr": self.hr_bpm or 0,
+            "calories": round(self.kcal_keytel_net, 1),
+            "calories_machine": round(frame.kcal_total, 1),
+        }, retain=True)
 
     # -- 通知回调 ----------------------------------------------------------- #
 
@@ -424,6 +533,33 @@ class Capture:
     def _on_ftms(self, raw: bytes) -> None:
         frame = Frame.parse(raw)
         if frame is None:
+            return
+
+        now_mono = time.monotonic()
+        self.last_frame_mono = now_mono
+
+        # 守护模式：等真正踩起来再开文件。面板通电后闲置时也会推零值，
+        # 那种数据录进去只会把 FIT 前面拉一条长尾。
+        if not self.started:
+            moving = frame.cadence_spm > 0 or frame.speed_kmh > 0.05
+            if self.start_mode != "signal" and not moving:
+                self.last_elapsed = frame.elapsed_s
+                return
+            self.ensure_started()
+
+        # 面板闲置五分钟会自动清零。计数器倒退 = 上一局结束、新一局开始。
+        prev_elapsed = self.last_elapsed
+        panel_reset = (prev_elapsed is not None
+                       and frame.elapsed_s + 5 < prev_elapsed)
+
+        if panel_reset and self.auto_mode:
+            # 守护模式：归零这一帧属于下一局，不计数、不写行，直接收尾。
+            # （单次模式仍会把它写进去，好让 export_fit 的 --on-reset 有据可依）
+            self.end_reason = "面板清零"
+            print(f"\n* 面板计时器归零（{prev_elapsed}s → {frame.elapsed_s}s），本局结束",
+                  flush=True)
+            if self._loop is not None:
+                self._loop.quit()
             return
 
         self.frames += 1
@@ -480,6 +616,9 @@ class Capture:
         }
         self.writer.writerow(row)
         self.csv_file.flush()
+
+        if self.mqtt:
+            self.publish_state(frame)
 
         if self.jsonl_file:
             self.jsonl_file.write(json.dumps({
@@ -568,7 +707,10 @@ class Capture:
     # -- 心率连接 ----------------------------------------------------------- #
 
     def attach_hr(self) -> bool:
-        found = self.bz.find(self.args.hr, self.args.hr_name, service=HRS_SERVICE)
+        addr, name = self.args.hr, self.args.hr_name
+        if not (addr or name) and getattr(self.args, "hr_any", False):
+            addr, name = "", ""          # 自动模式：看到谁在广播心率就用谁
+        found = self.bz.find(addr, name, service=HRS_SERVICE)
         if not found:
             return False
         path, props = found
@@ -607,85 +749,143 @@ class Capture:
     # -- 主循环 ------------------------------------------------------------- #
 
     def run(self) -> int:
+        """单次采集：自己找设备、连上、采到设定时长 / Ctrl+C 为止。"""
+        self.start_mode = "signal"
         self.bz.start_discovery()
-        print(f"* 输出 {self.csv_path}", flush=True)
-        if self.jsonl_file:
-            print(f"* 原始帧 {self.jsonl_path}", flush=True)
-        if self.hr_jsonl_file:
-            print(f"* 心率帧 {self.hr_jsonl_path}", flush=True)
+        self.ensure_started()
+        return self._capture_loop(deadline=self.args.duration or None)
 
+    def run_session(self, idle_timeout: float, disconnect_after: float) -> int:
+        """守护模式里的一局：设备已确定，采到信号消失 / 面板清零为止。"""
+        self.auto_mode = True
+        return self._capture_loop(idle_timeout=idle_timeout,
+                                  disconnect_after=disconnect_after)
+
+    def _capture_loop(self, deadline: float | None = None,
+                      idle_timeout: float | None = None,
+                      disconnect_after: float | None = None) -> int:
         loop = GLib.MainLoop()
-        state = {"deadline": time.time() + self.args.duration if self.args.duration else None,
-                 "stopped": False}
+        self._loop = loop
+        state = {
+            "deadline": time.time() + deadline if deadline else None,
+            "next_connect": 0.0,
+            "hr_next": 0.0,
+        }
 
-        def request_stop(*_a):
-            """Ctrl+C / SIGTERM：立刻退出主循环，交给 finally 收尾。"""
-            if not state["stopped"]:
-                state["stopped"] = True
-                print("\n* 收到中断信号，正在收尾…", flush=True)
+        def end(reason: str) -> None:
+            if not self.end_reason:
+                self.end_reason = reason
             loop.quit()
-            return GLib.SOURCE_CONTINUE
-
-        # 把信号接进 GLib 主循环，避免等 5 秒巡检才响应
-        _add_unix_signal(signal.SIGINT, request_stop)
-        _add_unix_signal(signal.SIGTERM, request_stop)
 
         def supervisor() -> bool:
-            if state["stopped"]:
-                loop.quit()
+            if _stop_requested():
+                print("\n* 收到中断信号，正在收尾…", flush=True)
+                end("收到中断")
                 return False
             if state["deadline"] and time.time() >= state["deadline"]:
                 print("* 到达设定时长，结束", flush=True)
-                loop.quit()
+                end("到达设定时长")
                 return False
 
-            if not self.connected:
-                self.attach()
-            else:
+            now_mono = time.monotonic()
+
+            # 掉线判定：BTL 链路断了基本就是面板关机 / 走远
+            if self.connected:
                 props = self.bz.properties(self.device_path, DEVICE_IFACE)
                 if props and not props.get("Connected"):
-                    print("* 椭圆机连接断开，重连中…", flush=True)
+                    print("* 椭圆机连接断开，尝试重连…", flush=True)
                     self.connected = False
+                    self.disconnected_since = now_mono
+            if self.connected:
+                self.disconnected_since = None
+            elif (disconnect_after and self.disconnected_since
+                  and now_mono - self.disconnected_since > disconnect_after):
+                print(f"* 已断开 {now_mono - self.disconnected_since:.0f}s，本局结束",
+                      flush=True)
+                end("设备断开")
+                return False
 
-            if self.args.hr or self.args.hr_name:
-                if not self.hr_connected:
-                    self.attach_hr()
-                else:
+            # 数据静默判定：连接还在但 0x2ACE 不再推送（关机前的最后一道防线）
+            if (idle_timeout and self.last_frame_mono
+                    and now_mono - self.last_frame_mono > idle_timeout):
+                print(f"* 已 {now_mono - self.last_frame_mono:.0f}s 没收到数据，本局结束",
+                      flush=True)
+                end("数据静默")
+                return False
+
+            # 重连（节流，避免 attach 阻塞把循环卡死）
+            if not self.connected and now_mono >= state["next_connect"]:
+                state["next_connect"] = now_mono + RECONNECT_INTERVAL
+                self.attach()
+                if self.connected and not self.disconnected_since:
+                    self.disconnected_since = None
+
+            # 心率设备跟随连接
+            want_hr = self.args.hr or self.args.hr_name or getattr(self.args, "hr_any", False)
+            if want_hr:
+                if self.hr_connected:
                     props = self.bz.properties(self.hr_path, DEVICE_IFACE)
                     if props and not props.get("Connected"):
                         print("* 心率连接断开，重连中…", flush=True)
                         self.hr_connected = False
+                elif now_mono >= state["hr_next"]:
+                    state["hr_next"] = now_mono + RECONNECT_INTERVAL
+                    self.attach_hr()
             return True
 
-        GLib.timeout_add_seconds(int(RECONNECT_INTERVAL), supervisor)
-
+        GLib.timeout_add_seconds(1, supervisor)
+        supervisor()                      # 先跑一次，立即发起连接
+        if not self.connected:            # 一次都没连上也要有超时兜底
+            self.disconnected_since = time.monotonic()
         try:
-            loop.run()
+            _run_loop(loop)
         finally:
-            self.detach()
-            self.detach_hr()
-            if self.device_path:
-                self.bz.disconnect(self.device_path)
-            if self.hr_path:
-                self.bz.disconnect(self.hr_path)
-            self.bz.stop_discovery()
-            self.csv_file.close()
-            if self.jsonl_file:
-                self.jsonl_file.close()
-            if self.hr_jsonl_file:
-                self.hr_jsonl_file.close()
-            msg = f"* 结束，FTMS {self.frames} 帧"
-            if self.hr_frames:
-                msg += f"，心率 {self.hr_frames} 帧"
-            print(f"{msg} -> {self.csv_path}", flush=True)
-            self.write_fit()
+            self._loop = None
+            self._shutdown()
         return 0
+
+    def _shutdown(self) -> None:
+        self.detach()
+        self.detach_hr()
+        if self.device_path:
+            self.bz.disconnect(self.device_path)
+        if self.hr_path:
+            self.bz.disconnect(self.hr_path)
+        self.bz.stop_discovery()
+        self.close_files()
+
+        if not self.started:
+            print("* 本次没有踩动，未产生文件", flush=True)
+            return
+
+        reason = f"（{self.end_reason}）" if self.end_reason else ""
+        msg = f"* 结束{reason}，FTMS {self.frames} 帧"
+        if self.hr_frames:
+            msg += f"，心率 {self.hr_frames} 帧"
+        print(f"{msg} -> {self.csv_path}", flush=True)
+
+        if self.mqtt:
+            self.mqtt.publish_json(f"{self.mqtt_topic}/session", {
+                "event": "end",
+                "session": self.stamp,
+                "session_no": self.session_no,
+                "reason": self.end_reason,
+                "frames": self.frames,
+                "hr_frames": self.hr_frames,
+            })
+        self.write_fit()
 
     # -- 收尾：生成 FIT ------------------------------------------------------ #
 
     def write_fit(self) -> None:
         """把刚写完的 CSV 转成 FIT。任何失败都只警告，不影响采集结果。"""
-        if not self.args.fit:
+        if not self.args.fit or not self.started:
+            return
+
+        min_frames = getattr(self.args, "auto_min_frames", 0) if self.auto_mode else 0
+        if self.frames < max(2, min_frames):
+            print(f"! 只采到 {self.frames} 帧（阈值 {max(2, min_frames)}），"
+                  f"保留 CSV 但不生成 FIT", file=sys.stderr)
             return
 
         try:
@@ -747,6 +947,154 @@ class Capture:
 
 
 # --------------------------------------------------------------------------- #
+# 守护模式：自动等设备 → 自动录 → 自动出 FIT
+# --------------------------------------------------------------------------- #
+
+class AutoRunner:
+    """长驻监听：椭圆机一出现就开一局，信号消失 / 面板清零就收尾出 FIT。"""
+
+    def __init__(self, bluez: Bluez, args) -> None:
+        self.bz = bluez
+        self.args = args
+        self.mqtt = None
+        self.sessions = 0
+        # BlueZ 不会删除已经消失的设备对象，偏不记住就会反复去连一台关机的机器
+        self.blocked: dict[str, float] = {}
+
+    def _candidate(self):
+        """当前可以直接开录的 FTMS 设备（跳过刚失败过的）。"""
+        now = time.monotonic()
+        cooldown = getattr(self.args, "auto_cooldown", 60.0)
+        for path, props in self.bz.devices():
+            if not self.bz.advertises(props, FTMS_SERVICE):
+                continue
+            address = props.get("Address", "")
+            if self.args.address and address.upper() != self.args.address.upper():
+                continue
+            if self.args.name:
+                label = props.get("Name") or props.get("Alias") or ""
+                if not label.startswith(self.args.name):
+                    continue
+            failed_at = self.blocked.get(address)
+            if failed_at and now - failed_at < cooldown:
+                continue
+            return path, props
+        return None
+
+    # -- MQTT --------------------------------------------------------------- #
+
+    def setup_mqtt(self):
+        host = getattr(self.args, "mqtt_host", "")
+        if not host:
+            return None
+        try:
+            from ftms_mqtt import MqttClient, ha_discovery
+        except Exception as exc:
+            print(f"! 加载 ftms_mqtt.py 失败，MQTT 关闭: {exc}", file=sys.stderr)
+            return None
+
+        topic = (self.args.mqtt_topic or "elliptical").rstrip("/")
+        client = MqttClient(
+            host, self.args.mqtt_port,
+            client_id=self.args.mqtt_client_id,
+            username=self.args.mqtt_user, password=self.args.mqtt_password,
+            will_topic=f"{topic}/availability",
+            verbose=getattr(self.args, "mqtt_debug", False),
+        ).start()
+        print(f"* MQTT   {host}:{self.args.mqtt_port} → {topic}/#", flush=True)
+        if getattr(self.args, "mqtt_ha", False):
+            ha_discovery(client, topic, self.args.prefix, f"{topic}/state")
+            print("* MQTT   已发布 Home Assistant 自动发现", flush=True)
+        return client
+
+    # -- 等设备 ------------------------------------------------------------- #
+
+    def wait_for_device(self):
+        """等一台 FTMS 椭圆机出现，返回 (path, props)；被中断则返回 None。"""
+        self.bz.start_discovery()
+        label = (self.args.address
+                 or (f"name~{self.args.name}" if self.args.name else "任意 FTMS 设备"))
+        print(f"* 等待椭圆机广播（{label}）…", flush=True)
+
+        last_beat = last_check = time.monotonic()
+        while not _stop_requested():
+            found = self._candidate()
+            if found:
+                self.bz.stop_discovery()
+                return found
+
+            now = time.monotonic()
+            if now - last_check > 5.0:            # BlueZ 偶尔会自己停掉 discovery
+                last_check = now
+                for path, _ in self.bz.adapters():
+                    props = self.bz.properties(path, ADAPTER_IFACE)
+                    if props and not props.get("Discovering"):
+                        self.bz.start_discovery()
+                    break
+            if now - last_beat > 300:             # 五分钟报一次平安
+                last_beat = now
+                print(f"* 仍在等待… {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+            time.sleep(0.5)
+
+        self.bz.stop_discovery()
+        return None
+
+    # -- 主循环 ------------------------------------------------------------- #
+
+    def run(self) -> int:
+        self.mqtt = self.setup_mqtt()
+        print(f"* 守护模式：空闲 {self.args.auto_stop_after:.0f}s 无数据 / "
+              f"断开 {self.args.auto_disconnect_after:.0f}s 即结束", flush=True)
+        try:
+            while not _stop_requested():
+                found = self.wait_for_device()
+                if not found:
+                    break
+
+                path, props = found
+                address = props.get("Address", "")
+                name = props.get("Name") or props.get("Alias") or "?"
+                self.sessions += 1
+                print(f"\n* [{time.strftime('%H:%M:%S')}] 发现 {name} ({address})"
+                      f" → 第 {self.sessions} 局", flush=True)
+
+                session_args = argparse.Namespace(**vars(self.args))
+                session_args.address = address
+                session_args.name = ""
+                if not (session_args.hr or session_args.hr_name):
+                    session_args.hr_any = True
+
+                cap = Capture(self.bz, session_args)
+                cap.mqtt = self.mqtt
+                cap.session_no = self.sessions
+                try:
+                    cap.run_session(self.args.auto_stop_after,
+                                    self.args.auto_disconnect_after)
+                except Exception as exc:              # 一局出错不能拖垮守护
+                    print(f"! 本局异常: {exc}", file=sys.stderr)
+
+                if cap.started:
+                    self.blocked.pop(address, None)
+                else:                                  # 没连上就冷却一阵，别死循环
+                    self.blocked[address] = time.monotonic()
+                    print(f"* {name} 本局未连上，{getattr(self.args, 'auto_cooldown', 60.0):.0f}s "
+                          f"内不再尝试", flush=True)
+
+                if self.mqtt:                          # 立即拿起下一个
+                    self.mqtt.publish_json(
+                        f"{self.args.mqtt_topic}/availability", "online", retain=True)
+                for _ in range(10):
+                    if _stop_requested():
+                        break
+                    time.sleep(0.2)
+        finally:
+            if self.mqtt:
+                self.mqtt.stop()
+            print("* 守护模式结束", flush=True)
+        return 0
+
+
+# --------------------------------------------------------------------------- #
 # 扫描
 # --------------------------------------------------------------------------- #
 
@@ -801,20 +1149,36 @@ def scan(bluez: Bluez, seconds: float) -> int:
 
 DEFAULTS = {
     "address": "", "name": "",
-    "hr": "", "hr_name": "",
+    "hr": "", "hr_name": "", "hr_any": False,
     "age": 0, "weight": 0.0, "sex": "m",
     "duration": 0.0, "scan_timeout": DISCOVERY_SECONDS,
     "outdir": "data", "prefix": "ride",
     "jsonl": False, "quiet": False,
     "fit": True, "fit_calories": "keytel_net", "fit_resistance": "percent",
+    # 守护模式
+    "auto": False,
+    "auto_stop_after": 300.0,
+    "auto_disconnect_after": 10.0,
+    "auto_min_frames": 10,
+    "auto_start_on": "motion",
+    "auto_cooldown": 60.0,
+    # MQTT
+    "mqtt_host": "", "mqtt_port": 1883, "mqtt_topic": "elliptical",
+    "mqtt_client_id": "elliptical-ftms",
+    "mqtt_user": "", "mqtt_password": "",
+    "mqtt_ha": False, "mqtt_debug": False,
 }
 
 # 配置文件里各个 section 能覆盖的键
 CONFIG_SECTIONS = {
-    "device": ("address", "name", "hr", "hr_name"),
+    "device": ("address", "name", "hr", "hr_name", "hr_any"),
     "profile": ("age", "weight", "sex"),
     "output": ("outdir", "prefix", "jsonl", "quiet", "duration",
                "fit", "fit_calories", "fit_resistance"),
+    "auto": ("auto", "auto_stop_after", "auto_disconnect_after",
+             "auto_min_frames", "auto_start_on", "auto_cooldown"),
+    "mqtt": ("mqtt_host", "mqtt_port", "mqtt_topic", "mqtt_client_id",
+             "mqtt_user", "mqtt_password", "mqtt_ha", "mqtt_debug"),
 }
 
 
@@ -830,9 +1194,10 @@ def load_config(path: str) -> dict:
         for key in keys:
             if key in data.get(section, {}):
                 flat[key] = data[section][key]
-    # 允许在顶层直接写键
+    # 允许在顶层直接写键（但要跳过 [section] 表，否则 [auto] 这种同名
+    # 段落会把 auto = true 覆盖成一整个 dict）
     for key in DEFAULTS:
-        if key in data:
+        if key in data and not isinstance(data[key], dict):
             flat[key] = data[key]
 
     unknown = [s for s in data if s not in CONFIG_SECTIONS and s not in DEFAULTS]
@@ -862,6 +1227,8 @@ def parse_args(argv=None):
     h = p.add_argument_group("心率（可选）")
     h.add_argument("--hr", default=None, help="心率设备 MAC")
     h.add_argument("--hr-name", default=None, help="心率设备名前缀，如 COROS")
+    h.add_argument("--hr-any", action="store_true", default=None,
+                   help="不指定 MAC，用任何在广播心率（0x180D）的设备")
     h.add_argument("--age", type=int, default=None,
                    help="年龄，用于 Keytel 心率热量公式")
     h.add_argument("--weight", type=float, default=None,
@@ -887,6 +1254,35 @@ def parse_args(argv=None):
                    choices=["percent", "raw", "turns"],
                    help="FIT 里 resistance 字段写哪个量（默认 percent）")
 
+    a = p.add_argument_group("守护模式")
+    a.add_argument("--auto", action="store_true", default=None,
+                   help="长驻监听：等椭圆机出现自动开录，信号消失自动出 FIT")
+    a.add_argument("--auto-stop-after", type=float, default=None,
+                   help="多少秒没有 FTMS 数据算结束（默认 300）")
+    a.add_argument("--auto-disconnect-after", type=float, default=None,
+                   help="掉线多少秒算结束（默认 10）")
+    a.add_argument("--auto-min-frames", type=int, default=None,
+                   help="少于这么多帧不生成 FIT（默认 10）")
+    a.add_argument("--auto-start-on", default=None, choices=["motion", "signal"],
+                   help="motion=踩动才开始（默认） / signal=一看到广播就开")
+    a.add_argument("--auto-cooldown", type=float, default=None,
+                   help="连不上的设备冷却多少秒再试（默认 60）")
+
+    m = p.add_argument_group("MQTT 广播（可选）")
+    m.add_argument("--mqtt-host", default=None,
+                   help="MQTT broker 地址，留空则不发")
+    m.add_argument("--mqtt-port", type=int, default=None, help="默认 1883")
+    m.add_argument("--mqtt-topic", default=None,
+                   help="主题前缀（默认 elliptical）")
+    m.add_argument("--mqtt-client-id", default=None,
+                   help="client id（默认 elliptical-ftms）")
+    m.add_argument("--mqtt-user", default=None, help="用户名")
+    m.add_argument("--mqtt-password", default=None, help="密码")
+    m.add_argument("--mqtt-ha", action="store_true", default=None,
+                   help="额外发布 Home Assistant 自动发现")
+    m.add_argument("--mqtt-debug", action="store_true", default=None,
+                   help="打印 MQTT 连接日志")
+
     args = p.parse_args(argv)
 
     # 三层合并：默认值 <- 配置文件 <- 命令行
@@ -910,6 +1306,7 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    _install_signals()
     try:
         bluez = Bluez()
     except GLib.Error as exc:
@@ -927,7 +1324,7 @@ def main(argv=None) -> int:
         print("! 没给 profile（age/weight），kcal_keytel 两列会是 0",
               file=sys.stderr)
 
-    if not args.quiet:
+    if not args.quiet and not args.auto:
         dev = args.address or (args.name and f"name~{args.name}") or "?"
         hrs = args.hr or (args.hr_name and f"name~{args.hr_name}") or ""
         prof = (f"{args.age}y/{args.weight:g}kg/{'男' if args.sex == 'm' else '女'}"
@@ -935,6 +1332,12 @@ def main(argv=None) -> int:
         print(f"* 椭圆机 {dev}", flush=True)
         print(f"* 心率   {hrs or '不采集'}", flush=True)
         print(f"* 个人参数 {prof}", flush=True)
+
+    if args.auto:
+        if args.duration:
+            print("! 守护模式下 --duration 不生效（每局由信号决定）",
+                  file=sys.stderr)
+        return AutoRunner(bluez, args).run()
 
     return Capture(bluez, args).run()
 

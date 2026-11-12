@@ -6,10 +6,12 @@
 #
 # 优先级：命令行参数 > config.toml > 内置默认值
 #
-#   python3 ftms_capture.py --config config.toml
+#   python3 ftms_capture.py --config config.toml            # 单次采集
+#   python3 ftms_capture.py --config config.toml --auto     # 长驻守护
 
 [device]
 # 椭圆机。address 精确匹配，name 是广播名前缀（二选一，address 优先）
+# 守护模式下建议填 address，免得把邻居家的椭圆机也录进来
 address = "EB:80:03:XX:XX:XX"
 name = ""
 
@@ -17,6 +19,8 @@ name = ""
 # COROS 手表需要先在表上打开「心率广播」
 hr = ""
 hr_name = ""
+# true = 不指定 MAC，用任何在广播心率（0x180D）的设备
+hr_any = false
 
 [profile]
 # Keytel (2005) 心率热量公式的个人参数
@@ -30,14 +34,45 @@ outdir = "data"
 prefix = "ride"
 jsonl = true       # 额外保存原始 0x2ACE 帧
 quiet = false      # true 则不打印每秒实时行
+duration = 0       # 单次采集时长（秒），0 = 一直采到 Ctrl+C
 
-# 采集结束后（Ctrl+C 或到达时长）自动把 CSV 转成 FIT 活动文件。
+# 采集结束后（Ctrl+C / 到达时长 / 守护模式一局结束）自动生成 FIT。
 # 运动类型固定写成「椭圆机」（sport=fitness_equipment / sub_sport=elliptical），
 # 可以直接导入 COROS。
 fit = true
+fit_calories = "keytel_net"   # power / keytel / keytel_net / machine / none
+fit_resistance = "percent"    # percent / raw / turns
 
-# FIT 里的卡路里用哪一路：power / keytel / keytel_net / machine / none
-fit_calories = "keytel_net"
+[auto]
+# 长驻监听：椭圆机一出现就开录，信号消失 / 面板清零就收尾出 FIT。
+# 需要配合命令行的 --auto，或者把 service 的 ExecStart 加上 --auto
+auto = false
 
-# FIT 里 resistance 字段写哪个量：percent（0-100）/ raw（0-91）/ turns（圈数）
-fit_resistance = "percent"
+# 多久没有 FTMS 数据算结束（秒）。这是掉线检测失灵时的兜底
+auto_stop_after = 300.0
+
+# 蓝牙链路断开多少秒算结束（秒）。面板关机 / 走远都属于这种，
+# 这是最主要的结束信号
+auto_disconnect_after = 10.0
+
+# 少于这么多帧不生成 FIT（踩几秒就停的不算一局）
+auto_min_frames = 10
+
+# motion = 真正踩动才开始记（默认，避免面板通电后闲置的零值进 FIT）
+# signal = 一看到广播就开始
+auto_start_on = "motion"
+
+# 连不上的设备冷却多少秒再试（BlueZ 会保留已消失设备的缓存对象）
+auto_cooldown = 60.0
+
+[mqtt]
+# 局域网 MQTT 广播。host 留空则完全关闭。
+mqtt_host = ""
+mqtt_port = 1883
+mqtt_topic = "elliptical"
+mqtt_client_id = "elliptical-ftms"
+mqtt_user = ""
+mqtt_password = ""
+# 额外发布 Home Assistant 自动发现配置
+mqtt_ha = false
+mqtt_debug = false

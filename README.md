@@ -5,6 +5,9 @@ YESOUL EF25 椭圆机（FTMS 设备）+ BLE 心率设备的 Linux 数据采集�
 不依赖厂商 App、不需要配对，直接用 BlueZ 订阅 GATT 通知，把椭圆机的实时数据
 （速度 / 距离 / 步频 / 阻力 / 功率 / 卡路里 / 时间）和独立心率带的数据一起落成 CSV。
 
+也可以挂成**长驻守护**：人一踩就自动开录，机器关机就自动收尾并生成 FIT，
+同时把实时数据通过 **MQTT** 广播到局域网。
+
 协议细节、字段逆向过程和标定数据见 **[PROTOCOL.md](PROTOCOL.md)**。
 
 ---
@@ -185,6 +188,120 @@ python3 ftms_capture.py --config config.toml --hr ""
 
 ---
 
+## 守护模式（自动开录 / 自动收尾）
+
+```bash
+python3 ftms_capture.py --config config.toml --auto
+```
+
+跑起来之后什么都不用管：
+
+```
+* 等待椭圆机广播（name~YS_）…
+* [20:03:12] 发现 YS_EF25_00156 (EB:80:03:5D:73:AF) → 第 1 局
+* 连接椭圆机 EB:80:03:5D:73:AF YS_EF25_00156
+* 已订阅 Cross Trainer Data，等待数据…
+* 开始记录 data/ride_20261112_200318.csv
+2026-11-12 20:03:20  00:02   8.42km/h  均速 8.40   17m  步频  52  阻力 12.0(0.9圈)   96W    0.21kcal  ♥118
+...
+* 面板计时器归零（1150s → 1s），本局结束
+* 结束（面板清零），FTMS 1148 帧，心率 1160 帧 -> data/ride_20261112_200318.csv
+* FIT  data/ride_20261112_200318.fit  (38241 字节)
+   椭圆机 · 1148s · 3210 m · 心率均 128 bpm
+* 等待椭圆机广播（name~YS_）…
+```
+
+一局结束的判定，按优先级：
+
+| 信号 | 含义 | 默认 |
+|---|---|---|
+| **面板计时器归零** | 闲置 5 分钟机器自动清零，这一局结束 | 立即 |
+| **蓝牙链路断开** | 面板关机 / 走远 | 10 s |
+| **FTMS 数据静默** | 连接还在但不推数据 | 300 s |
+| `Ctrl+C` | 手动停止 | 立即 |
+
+蓝牙链路断开是最主要的信号，数据静默只是兜底 —— 中间歇一会儿不会把一局切断。
+
+### 为什么是「踩动才开始」而不是「看到信号就开始」
+
+面板通电后即使没人踩也会推零值。默认 `--auto-start-on motion` 会等第一次
+`步频 > 0` 或 `速度 > 0` 才建文件，否则你开个机走开五分钟就能录出一坨零。
+想改成「一看到广播就开」，用 `--auto-start-on signal`。
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--auto` | 关 | 长驻监听 |
+| `--auto-start-on` | `motion` | `motion` 踩动才开 / `signal` 见到广播就开 |
+| `--auto-disconnect-after` | `10` | 掉线多少秒算结束 |
+| `--auto-stop-after` | `300` | 多久没数据算结束 |
+| `--auto-min-frames` | `10` | 少于这么多帧不生成 FIT |
+| `--auto-cooldown` | `60` | 连不上的设备冷却多久再试 |
+| `--hr-any` | 关 | 不指定 MAC，用任何广播心率的设备 |
+
+守护模式里如果没配 `hr` / `hr-name`，会自动用**任何**广播 `0x180D` 的设备
+（比如手表开了心率广播）。
+
+### 一个坑：BlueZ 不删已消失的设备
+
+设备关机后 `org.bluez` 里那个对象还在，直接按它去连会一直失败。所以连不上的
+设备会被冷却 `auto_cooldown` 秒，避免每 10 秒重试一次的垃圾循环。
+
+---
+
+## MQTT 广播（可选）
+
+```toml
+[mqtt]
+mqtt_host = "10.0.0.136"      # 留空则完全关闭
+mqtt_port = 1883
+mqtt_topic = "elliptical"
+mqtt_ha = false               # true = 额外发 Home Assistant 自动发现
+```
+
+发布的内容：
+
+| 主题 | 保留 | 内容 |
+|---|---|---|
+| `elliptical/state` | 是 | 1 Hz 实时状态（见下） |
+| `elliptical/session` | 否 | `{"event":"start"\|"end", ...}` |
+| `elliptical/availability` | 是 | `online` / `offline`（LWT 遗嘱） |
+
+`state` 的 JSON：
+
+```json
+{"ts":"20261112_200318","elapsed":142,"speed":8.42,"cadence":52,
+ "power":96,"resistance":13.2,"resistance_raw":12.0,"distance":120,
+ "hr":118,"calories":2.4,"calories_machine":3.1}
+```
+
+`availability` 用 LWT 实现：进程被 kill -9 或断电时，broker 会替你发 `offline`。
+
+**客户端是自带实现的**（`ftms_mqtt.py`，MQTT 3.1.1，只做发布），
+不需要 `pip install paho-mqtt` —— 目标机器是 Debian 12，pip 有 PEP 668 限制，
+少一个依赖少一堆事。支持用户名密码、QoS 0/1、retain、断线指数退避重连。
+
+---
+
+## 部署成后台服务
+
+```bash
+ssh syhan@10.0.0.177
+~/elliptical-ftms/deploy/install.sh
+```
+
+`install.sh` 会装 `bluez` + `python3-gi`、克隆仓库、生成 `config.toml`、
+装一个 **systemd 用户服务**并 `enable-linger`（不登录也随开机启动）。
+
+```bash
+journalctl --user -u elliptical-ftms -f     # 看日志
+systemctl --user restart elliptical-ftms    # 重启
+systemctl --user stop elliptical-ftms       # 停止（会先写完 FIT）
+```
+
+服务收到 SIGTERM 会走正常收尾流程（关文件、写 FIT），`TimeoutStopSec=60`。
+
 ## 导出 FIT
 
 **采集结束时（Ctrl+C 或到达 `--duration`）会自动生成同名 `.fit`，不需要额外操作。**
@@ -279,6 +396,31 @@ python3 export_fit.py data/ride_20261109_235238.csv -o ~/elliptical.fit
 - 必需的 `file_id` / `session` / `lap` / `record` / `activity` 齐全
 - `lap` 与 `session` 数量匹配、`activity` 恰好 1 条
 
+### 面板清零与末尾空闲的裁切
+
+椭圆机闲置约 5 分钟会把计时器、距离、卡路里全部归零。这带来两个问题：
+
+1. **跨度越长，FIT 越离谱** —— 计时器倒退会让时长对不上，距离倒退会被当成
+   脏数据修补。所以默认 `--on-reset cut`：一旦发现计数器倒退，就在**第一处**
+   截断，只导出前面那一局（一条 FIT 只能装一局）。
+2. **末尾挂着几分钟零值** —— 面板关机前、或者你擦完汗坐着的时候还在推零。
+   默认 `--trim-idle 60` 保留最后一次踩动后的 60 秒收尾，再后面的全裁掉。
+
+想看完整原始数据（不裁）：
+
+```bash
+python3 export_fit.py data/ride.csv --on-reset ignore --trim-idle 0
+```
+
+报告里会写清楚发生了什么：
+
+```
+  面板计数器归零    1 处（已在首处截断）
+  末尾空闲已裁掉    340 行
+```
+
+守护模式在归零的**那一刻**就收尾，所以正常情况下 CSV 里根本不会有归零。
+
 ### 参数
 
 | 参数 | 默认 | 说明 |
@@ -290,6 +432,8 @@ python3 export_fit.py data/ride_20261109_235238.csv -o ~/elliptical.fit
 | `--resistance` | `percent` | `resistance` 字段写 raw / turns / percent |
 | `--max-hr-age` | `10` | 心率过期阈值（秒） |
 | `--max-gap` | `10` | 超过该秒数的空档算停顿，不计入计时 |
+| `--on-reset` | `cut` | 面板计时器归零时：`cut` 在首处截断 / `ignore` 不管 |
+| `--trim-idle` | `60` | 末尾连续空闲超过该秒数就裁掉（保留 60 s 收尾），0 = 不裁 |
 | `--device-name` | `ftms_capture` | FIT 里的设备名 |
 | `--manufacturer` | `255` | FIT manufacturer 编号（294 = coros） |
 | `--mimic-coros` | 关 | 伪造 COROS 设备身份，见下 |
@@ -351,7 +495,8 @@ python3 export_fit.py data/ride_20261109_235238.csv --mimic-coros
 
 ## 注意事项
 
-- **静止约 5 分钟机器会整场重置**，距离/时间/卡路里归零。要完整记录一场就别停太久。
+- **静止约 5 分钟机器会整场重置**，距离/时间/卡路里归零。这个归零被当成
+  「一局结束」的信号：守护模式当场收尾，导出器也会在第一处归零处截断（见下）。
 - **阻力不用踩也能读到**（offset 16 照常上报），可以拿来调旋钮做标定。
 - 机器**不带心率传感器**，心率必须外接。
 - 功率不是真实功率计：实测 `power ≈ 1.16×步频 + 0.65×阻力 − 54`（R²=0.971），
@@ -379,7 +524,11 @@ elliptical-ftms/
 ├── PROTOCOL.md            # 完整协议逆向记录（字段表、标定、证据、踩坑）
 ├── LICENSE                # MIT
 ├── config.toml.example    # 配置模板（复制成 config.toml 使用）
-├── ftms_capture.py        # 采集脚本
+├── ftms_capture.py        # 采集脚本（单次 / 守护模式）
+├── ftms_mqtt.py           # 零依赖 MQTT 3.1.1 发布客户端
 ├── export_fit.py          # CSV → FIT 导出（自带编码器与校验器）
+├── deploy/
+│   ├── install.sh                 # 目标机一键部署
+│   └── elliptical-ftms.service    # systemd 用户服务
 └── data/                  # 采集输出（已 gitignore）
 ```

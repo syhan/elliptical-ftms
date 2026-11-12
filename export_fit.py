@@ -327,6 +327,7 @@ def _num(row: dict, key: str) -> float:
 class Sample:
     t: float              # Unix 时间戳（秒，可为小数）
     iso: str              # 本地时间字符串，用于推导时区偏移
+    elapsed_s: float      # 面板计时器（秒），闲置五分钟会归零
     speed_kmh: float
     distance_m: float
     cadence_spm: float
@@ -351,6 +352,9 @@ class Issues:
     duplicate_seconds: int = 0
     non_monotonic: int = 0
     bad_distance: int = 0
+    panel_resets: int = 0
+    reset_action: str = "cut"
+    trimmed: int = 0
     dropped: dict = field(default_factory=dict)
     hr_dropped: int = 0
 
@@ -367,6 +371,11 @@ class Issues:
             lines.append(f"  时间倒退重排      {self.non_monotonic}")
         if self.bad_distance:
             lines.append(f"  距离缺失修补      {self.bad_distance}")
+        if self.panel_resets:
+            how = "已在首处截断" if self.reset_action == "cut" else "未截断"
+            lines.append(f"  面板计数器归零    {self.panel_resets} 处（{how}）")
+        if self.trimmed:
+            lines.append(f"  末尾空闲已裁掉    {self.trimmed} 行")
         for name, count in self.dropped.items():
             lines.append(f"  越界已丢弃        {name} × {count}")
         if self.hr_dropped:
@@ -383,7 +392,45 @@ LIMITS = {
 }
 
 
-def load_samples(path: Path, issues: Issues, max_hr_age: float) -> list[Sample]:
+def _is_panel_reset(prev: Sample, cur: Sample) -> bool:
+    """面板闲置五分钟会自动清零：计时器或距离倒退就是新的一局。"""
+    if math.isfinite(prev.elapsed_s) and math.isfinite(cur.elapsed_s):
+        if cur.elapsed_s + 5 < prev.elapsed_s:
+            return True
+    if math.isfinite(prev.distance_m) and math.isfinite(cur.distance_m):
+        if cur.distance_m + 50 < prev.distance_m:
+            return True
+    return False
+
+
+def _is_idle(sample: Sample) -> bool:
+    return sample.cadence_spm <= 0 and sample.speed_kmh < 0.1
+
+
+def trim_trailing_idle(samples: list[Sample], keep_seconds: float) -> tuple[list[Sample], int]:
+    """裁掉末尾的空闲尾吧。
+
+    面板关机前、或者你擦完汗坐下来那几分钟，0x2ACE 还在推零值。
+    保留最后一次踩动后面的 keep_seconds 秒当作收尾，再后面的全部丢掉。
+    keep_seconds <= 0 表示不裁。
+    """
+    if keep_seconds <= 0 or len(samples) < 2:
+        return samples, 0
+
+    last_active = None
+    for i, sample in enumerate(samples):
+        if not _is_idle(sample):
+            last_active = i
+    if last_active is None or last_active == len(samples) - 1:
+        return samples, 0
+
+    cut_at = samples[last_active].t + keep_seconds
+    kept = [s for s in samples if s.t <= cut_at]
+    return kept, len(samples) - len(kept)
+
+
+def load_samples(path: Path, issues: Issues, max_hr_age: float,
+                 on_reset: str = "cut", trim_idle: float = 60.0) -> list[Sample]:
     samples: list[Sample] = []
     with path.open(newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
@@ -396,6 +443,7 @@ def load_samples(path: Path, issues: Issues, max_hr_age: float) -> list[Sample]:
                 Sample(
                     t=t,
                     iso=row.get("iso_time", ""),
+                    elapsed_s=_num(row, "elapsed_s"),
                     speed_kmh=_num(row, "speed_kmh"),
                     distance_m=_num(row, "distance_m"),
                     cadence_spm=_num(row, "cadence_spm"),
@@ -424,6 +472,16 @@ def load_samples(path: Path, issues: Issues, max_hr_age: float) -> list[Sample]:
             deduped[-1] = sample
         else:
             deduped.append(sample)
+
+    # 面板闲置五分钟会自动清零。一条 FIT 只能装一局，所以默认在第一处
+    # 归零处截断；守护模式会在归零的那一刻就收尾，不会走到这里。
+    resets = [i for i in range(1, len(deduped))
+              if _is_panel_reset(deduped[i - 1], deduped[i])]
+    if resets:
+        issues.panel_resets = len(resets)
+        issues.reset_action = on_reset
+        if on_reset == "cut":
+            deduped = deduped[:resets[0]]
 
     # 数值清洗
     for sample in deduped:
@@ -457,7 +515,9 @@ def load_samples(path: Path, issues: Issues, max_hr_age: float) -> list[Sample]:
         else:
             last = sample.distance_m
 
-    return deduped
+    kept, trimmed = trim_trailing_idle(deduped, trim_idle)
+    issues.trimmed = trimmed
+    return kept
 
 
 # --------------------------------------------------------------------------- #
@@ -972,6 +1032,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-gap", type=float, default=10.0,
         help="超过该秒数的空档视为停顿，不计入计时",
     )
+    parser.add_argument(
+        "--on-reset", choices=["cut", "ignore"], default="cut",
+        help="面板计时器归零（闲置 5 分钟自动清零）时怎么处理：cut=在首处截断（默认）/ ignore=不管",
+    )
+    parser.add_argument(
+        "--trim-idle", type=float, default=60.0,
+        help="末尾连续空闲超过该秒数就裁掉，保留这么多秒收尾（0 = 不裁，默认 60）",
+    )
     parser.add_argument("--device-name", default="ftms_capture", help="FIT 中的设备名")
     parser.add_argument(
         "--manufacturer", type=int, default=MANUFACTURER_DEVELOPMENT,
@@ -1018,7 +1086,8 @@ def main(argv: list[str] | None = None) -> int:
     sub_sport = resolve_sub_sport(str(args.sub_sport))
 
     issues = Issues()
-    samples = load_samples(csv_path, issues, args.max_hr_age)
+    samples = load_samples(csv_path, issues, args.max_hr_age,
+                           on_reset=args.on_reset, trim_idle=args.trim_idle)
     if len(samples) < 2:
         raise SystemExit(f"有效样本不足（{len(samples)} 条），无法生成 FIT")
 
