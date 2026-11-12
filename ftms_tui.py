@@ -302,6 +302,21 @@ def _rule(width: int, left: str = "├", right: str = "┤") -> str:
     return left + "─" * inner + right
 
 
+def _title_line(width: int, title: str, date: str, wall: str, status: str,
+                color: bool = True) -> str:
+    """标题栏。
+
+    右边从「日期 时间 状态」开始，宽度不够就依次丢掉日期、状态 ——
+    时间永远保留，否则窄终端上就看不到现在几点了。
+    """
+    wall_txt = paint(wall, "bold", "white") if color else wall
+    for right in (f"{date} {wall_txt} {status}", f"{wall_txt} {status}", wall_txt):
+        suffix_len = 1 + vlen(right) + 2
+        if width - len("┌─ ") - 1 - suffix_len >= 8:
+            return _titled(width, title, right)
+    return _titled(width, "", wall_txt)
+
+
 def _titled(width: int, title: str, right_text: str = "") -> str:
     prefix = "┌─ "
     suffix = f" {right_text} ┐" if right_text else " ┐"
@@ -362,8 +377,9 @@ def render_medium(snap: dict, cols: int, rows: int, color: bool = True) -> list[
     has_hr = hr > 0
 
     title = snap["device"] or "FTMS"
-    clock = time.strftime("%H:%M:%S")
-    out = [_titled(cols, title, f"{status} {clock}")]
+    status_txt = paint(status, scolor) if color else status
+    out = [_title_line(cols, title, time.strftime("%m-%d"),
+                       time.strftime("%H:%M:%S"), status_txt, color)]
 
     # 主数值行
     inner = cols - 2
@@ -507,15 +523,14 @@ def render_full(snap: dict, cols: int, rows: int, color: bool = True) -> list[st
     wall = time.strftime("%H:%M:%S")
     date = time.strftime("%m-%d")
     status_txt = paint(status, scolor) if color else status
-    wall_txt = paint(wall, "bold", "white") if color else wall
-    out = [_titled(cols, title, f"{date} {wall_txt} {status_txt}")]
+    out = [_title_line(cols, title, date, wall, status_txt, color)]
     inner = cols - 2
 
     clock = _fmt_clock(snap["elapsed"])
     minutes = str(int(snap["elapsed"]) // 60)
 
     band1 = [
-        {"label": "速度", "value": f"{snap['speed']:.2f}", "unit": "km/h",
+        {"label": "瞬时速度", "value": f"{snap['speed']:.2f}", "unit": "km/h",
          "style": "cyan"},
         {"label": "心率", "value": str(hr) if has_hr else "--", "unit": "bpm",
          "style": "red" if has_hr else "grey", "heart": True, "has_hr": has_hr},
@@ -531,18 +546,16 @@ def render_full(snap: dict, cols: int, rows: int, color: bool = True) -> list[st
     band3 = [
         {"label": "距离", "value": str(snap["distance"]), "unit": "m",
          "style": "blue"},
-        {"label": "均速", "value": f"{snap['avg_speed']:.2f}", "unit": "km/h",
-         "style": "cyan"},
         {"label": "消耗", "value": f"{snap['kcal']:.0f}", "unit": "kcal",
          "style": "red"},
     ]
-    # 屏幕够高才有第四排：墙上时钟 + 用时。
-    # 只放两格，这样 HH:MM:SS 的大字（40 列）能完整显示，不会被砍掉秒。
+    # 屏幕够高才有第四排。左上角那个大字本来就是瞬时速度，所以这里放
+    # 用时和均速，跟第一排形成「瞬时 vs 平均」的对照，不重复。
     band4 = [
-        {"label": "现在", "value": wall, "unit": "", "style": "white",
-         "fallback": wall[:5]},
         {"label": "用时", "value": clock, "unit": "", "style": "white",
          "fallback": minutes},
+        {"label": "均速", "value": f"{snap['avg_speed']:.2f}", "unit": "km/h",
+         "style": "cyan"},
     ]
 
     bands = [band1]
