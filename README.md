@@ -254,7 +254,7 @@ python3 ftms_capture.py --config config.toml --auto
 
 ```toml
 [mqtt]
-mqtt_host = "10.0.0.136"      # 留空则完全关闭
+mqtt_host = "127.0.0.1"       # 留空则完全关闭
 mqtt_port = 1883
 mqtt_topic = "elliptical"
 mqtt_ha = false               # true = 额外发 Home Assistant 自动发现
@@ -277,6 +277,10 @@ mqtt_ha = false               # true = 额外发 Home Assistant 自动发现
 ```
 
 `availability` 用 LWT 实现：进程被 kill -9 或断电时，broker 会替你发 `offline`。
+
+broker 有两种选择：指向已有的（Home Assistant 之类），或者**让被记录的机器
+自己当 broker** —— `deploy/install.sh` 默认会装 `mosquitto` 并配置成局域网可读，
+这样最省事：机器常开，局域网里谁都能订阅。
 
 **客户端是自带实现的**（`ftms_mqtt.py`，MQTT 3.1.1，只做发布），
 不需要 `pip install paho-mqtt` —— 目标机器是 Debian 12，pip 有 PEP 668 限制，

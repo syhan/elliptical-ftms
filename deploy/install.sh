@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
-# 在目标机上以普通用户运行。只有安装系统包那一步需要 sudo。
+# 在目标机上以普通用户运行。会提示一次 sudo 密码（Debian 的 sudo 有 15 分钟
+# 缓存，中间不会再问）。
 #
 #   ssh syhan@10.0.0.177
 #   ~/elliptical-ftms/deploy/install.sh
+#
+# 环境变量：
+#   WITH_MQTT=0      跳过 mosquitto（默认 1，在这台机器上起局域网 broker）
+#   REPO=...         仓库地址
+#   DIR=...          安装目录（默认 $HOME/elliptical-ftms）
 #
 set -euo pipefail
 
 REPO="${REPO:-https://github.com/syhan/elliptical-ftms.git}"
 DIR="${DIR:-$HOME/elliptical-ftms}"
+WITH_MQTT="${WITH_MQTT:-1}"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
-say "1/5 检查 Python"
+# ---------------------------------------------------------------------------
+say "0/6 检查 sudo（只需输一次密码）"
+sudo -v
+# 后台续期，避免装到一半又要密码
+( while kill -0 "$$" 2>/dev/null; do sudo -n true; sleep 50; done ) 2>/dev/null &
+
+say "1/6 检查 Python"
 python3 - <<'PY'
 import sys
 if sys.version_info < (3, 11):
@@ -19,26 +32,52 @@ if sys.version_info < (3, 11):
 print("  Python", sys.version.split()[0], "OK")
 PY
 
-say "2/5 安装 bluez + python3-gi（需要 sudo 密码）"
-if ! dpkg -s bluez >/dev/null 2>&1 || ! dpkg -s python3-gi >/dev/null 2>&1; then
-    sudo apt-get update
-    sudo apt-get install -y bluez python3-gi
+say "2/6 安装系统包"
+PKGS="bluez python3-gi"
+[ "$WITH_MQTT" = "1" ] && PKGS="$PKGS mosquitto"
+need=0
+for p in $PKGS; do
+    dpkg -s "$p" >/dev/null 2>&1 || need=1
+done
+if [ "$need" = "1" ]; then
+    sudo apt-get update -qq
+    sudo apt-get install -y $PKGS
 else
     echo "  已安装，跳过"
 fi
-sudo systemctl enable --now bluetooth
 
-say "3/5 等待蓝牙适配器"
-for i in $(seq 1 20); do
+say "3/6 启动 bluetoothd 并确认适配器"
+sudo systemctl enable --now bluetooth
+OK=0
+for i in $(seq 1 25); do
     if bluetoothctl list 2>/dev/null | grep -q Controller; then
         bluetoothctl list | sed 's/^/  /'
+        OK=1
         break
     fi
-    [ "$i" = 20 ] && { echo "  ! 20 秒内没有控制器，检查硬件/固件"; exit 1; }
     sleep 1
 done
+if [ "$OK" = "0" ]; then
+    echo "  ! 25 秒内没找到控制器。检查：rfkill list / dmesg | grep -i blue" >&2
+    exit 1
+fi
 
-say "4/5 取仓库"
+if [ "$WITH_MQTT" = "1" ]; then
+    say "3b/6 配置局域网 MQTT broker"
+    sudo install -m 644 "$DIR/deploy/mosquitto-elliptical.conf" \
+        /etc/mosquitto/conf.d/elliptical.conf
+    sudo systemctl enable --now mosquitto
+    if systemctl is-active --quiet ufw; then
+        sudo ufw allow 1883/tcp >/dev/null
+        echo "  ufw: 已放行 1883/tcp"
+    fi
+    sleep 1
+    sudo ss -lntp | grep -q ':1883' \
+        && echo "  mosquitto 正在 1883 监听" \
+        || echo "  ! 1883 没有监听，看 journalctl -u mosquitto" >&2
+fi
+
+say "4/6 取仓库"
 if [ -d "$DIR/.git" ]; then
     git -C "$DIR" pull --ff-only
 else
@@ -50,11 +89,12 @@ if [ ! -f "$DIR/config.toml" ]; then
 fi
 mkdir -p "$DIR/data"
 
-say "5/5 安装 systemd 用户服务"
+say "5/6 安装 systemd 用户服务"
 mkdir -p "$HOME/.config/systemd/user"
 cp "$DIR/deploy/elliptical-ftms.service" "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
-# 开机即启动（用户服务需要 linger 才能在没登录时跑）
+
+say "6/6 开机自启（linger）"
 if ! loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
     sudo loginctl enable-linger "$USER"
 fi
@@ -63,6 +103,7 @@ systemctl --user enable --now elliptical-ftms.service
 say "完成"
 systemctl --user --no-pager status elliptical-ftms.service || true
 echo
-echo "查看日志：  journalctl --user -u elliptical-ftms -f"
-echo "重启服务：  systemctl --user restart elliptical-ftms"
-echo "停止服务：  systemctl --user stop elliptical-ftms"
+echo "看日志：  journalctl --user -u elliptical-ftms -f"
+echo "重启：    systemctl --user restart elliptical-ftms"
+echo "停止：    systemctl --user stop elliptical-ftms   # 会先写完 FIT"
+echo "MQTT：    mosquitto_sub -h localhost -t 'elliptical/#' -v"
