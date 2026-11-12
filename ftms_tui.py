@@ -125,6 +125,7 @@ BIG_FONT = {
     "8": ("████", "█  █", "████", "█  █", "████"),
     "9": ("████", "█  █", "████", "   █", "████"),
     ".": ("    ", "    ", "    ", "    ", "██  "),
+    ":": ("    ", " ██ ", "    ", " ██ ", "    "),
     "-": ("    ", "    ", "████", "    ", "    "),
     " ": ("    ", "    ", "    ", "    ", "    "),
 }
@@ -248,15 +249,6 @@ LIVE = LiveState()
 # 渲染
 # --------------------------------------------------------------------------- #
 
-HR_ZONES = (
-    (50, "热身", "blue"),
-    (60, "燃脂", "green"),
-    (70, "有氧", "yellow"),
-    (85, "无氧", "red"),
-    (200, "极限", "magenta"),
-)
-
-
 def _status_of(snap: dict) -> tuple[str, str]:
     age = snap["age"]
     if age is None or age > 15:
@@ -266,16 +258,6 @@ def _status_of(snap: dict) -> tuple[str, str]:
     if age > 3:
         return "信号弱", "yellow"
     return "记录中", "green"
-
-
-def _hr_zone(bpm: int, hr_max: int = 180) -> tuple[int, str, str]:
-    if bpm <= 0:
-        return 0, "无心率", "grey"
-    pct = round(bpm * 100 / hr_max) if hr_max else 0
-    for limit, name, color in HR_ZONES:
-        if pct < limit:
-            return pct, name, color
-    return pct, "极限", "magenta"
 
 
 def _fmt_clock(seconds: int) -> str:
@@ -292,7 +274,11 @@ def _spark(values: list[float], width: int) -> str:
         return " " * width
     vals = values[-width:]
     peak = max(vals) or 1.0
-    out = "".join(blocks[min(len(blocks) - 1, int(v / peak * (len(blocks) - 1)))]
+    low = min(vals)
+    if peak - low < 1e-9:                 # 数值恒定，别画成一堵实心墙
+        return (blocks[len(blocks) // 2] * len(vals)).rjust(width)
+    out = "".join(blocks[min(len(blocks) - 1,
+                             int((v - low) / (peak - low) * (len(blocks) - 1)))]
                   for v in vals)
     return out.rjust(width)
 
@@ -373,7 +359,7 @@ def render_medium(snap: dict, cols: int, rows: int, color: bool = True) -> list[
     """中等屏幕：有边框，没有大字。"""
     status, scolor = _status_of(snap)
     hr = snap["hr"]
-    pct, zone, zcolor = _hr_zone(hr)
+    has_hr = hr > 0
 
     title = snap["device"] or "FTMS"
     clock = time.strftime("%H:%M:%S")
@@ -383,13 +369,12 @@ def render_medium(snap: dict, cols: int, rows: int, color: bool = True) -> list[
     inner = cols - 2
     num = f"{snap['speed']:6.2f}"
     left = (paint(num, "bold", "cyan") if color else num) + " km/h"
-    if hr:
-        hnum = f"♥ {hr}"
-        right = (paint(hnum, "bold", zcolor) if color else hnum) + " bpm"
-        if vlen(left) + vlen(right) + vlen(zone) + 4 <= inner:
-            right += f" {zone}"
+    heart = _heart(has_hr, snap["now"], color)
+    if has_hr:
+        hnum = f"{hr}"
+        right = heart + " " + (paint(hnum, "bold", "red") if color else hnum) + " bpm"
     else:
-        right = "♥ --"
+        right = heart + " -- bpm"
     gap = max(1, inner - 1 - vlen(left) - vlen(right))
     out.append(_row(" " + left + " " * gap + right, cols))
 
@@ -419,106 +404,150 @@ def render_medium(snap: dict, cols: int, rows: int, color: bool = True) -> list[
     return out[:rows]
 
 
+CELL_ROWS = 5
+
+
+def _fit_big(value: str, width: int) -> str | None:
+    """放得下就返回大字用的字符串，放不下返回 None（退回普通文本）。"""
+    if big_width(value) <= width:
+        return value
+    if "." in value:
+        head = value.split(".")[0]
+        if big_width(head) <= width:
+            return head
+    return None
+
+
+RES_LEVELS = " ▁▂▃▄▅▆▇█"
+
+
+def res_meter(pct: float, cells: int = 10) -> list[tuple[str, bool]]:
+    """阻力格栅：高度递增的一排小竖条，亮起的部分表示当前阻力。"""
+    pct = max(0.0, min(100.0, pct))
+    lit = int(round(pct / 100.0 * cells))
+    out = []
+    for i in range(cells):
+        height = 1 + round(i * (len(RES_LEVELS) - 2) / max(1, cells - 1))
+        out.append((RES_LEVELS[height], i < lit))
+    return out
+
+
+def _heart(has_hr: bool, now: float, color: bool) -> str:
+    """有心率时红心按 0.8 秒一拍闪，没有心率就灰色常亮。"""
+    if not has_hr:
+        return paint("♥", "grey") if color else "♥"
+    if int(now * 1.25) % 2 == 0:
+        return paint("♥", "red", "bold") if color else "♥"
+    return " "
+
+
+def _band_lines(cells: list[dict], inner: int, color: bool, now: float) -> list[str]:
+    """一排读数：5 行大字 + 1 行标签/仪表。"""
+    n = len(cells)
+    base = inner // n
+    widths = [base] * (n - 1) + [inner - base * (n - 1)]
+
+    body: list[str] = []
+    for r in range(CELL_ROWS):
+        parts = []
+        for i, cell in enumerate(cells):
+            w = widths[i]
+            shown = _fit_big(cell["value"], w)
+            if shown is None and cell.get("fallback"):
+                shown = _fit_big(cell["fallback"], w)
+            if shown is None:
+                text = cell["value"] if r == CELL_ROWS // 2 else ""
+                parts.append(ljust(clip(center(text, w), w), w))
+                continue
+            text = center(big(shown)[r], w)
+            style = cell.get("style")
+            parts.append(paint(text, style) if (color and style) else text)
+        body.append("".join(parts))
+
+    parts = []
+    for i, cell in enumerate(cells):
+        w = widths[i]
+        if cell.get("meter") is not None:
+            label = cell.get("label", "")
+            cell_count = 10 if w >= 18 else 5
+            seg = "".join(
+                (paint(ch, "green", "bold") if on else paint(ch, "grey")) if color else ch
+                for ch, on in res_meter(cell["meter"], cell_count)
+            )
+            text = center(f"{label} {seg}" if label else seg, w)
+        else:
+            label = cell.get("label", "")
+            unit = cell.get("unit", "")
+            heart = ""
+            if cell.get("heart"):
+                heart = _heart(cell.get("has_hr", False), now, color) + " "
+            text = center(f"{heart}{label} {unit}".rstrip(), w)
+        parts.append(clip(text, w) if vlen(text) > w else text)
+    body.append("".join(parts))
+    return body
+
+
 def render_full(snap: dict, cols: int, rows: int, color: bool = True) -> list[str]:
-    """大屏：大字 + 面积图，把屏幕吃满。"""
+    """大屏：全部指标都上大字，图表只占底下一点点。"""
     status, scolor = _status_of(snap)
     hr = snap["hr"]
-    pct, zone, zcolor = _hr_zone(hr)
+    has_hr = hr > 0
+    now = snap["now"]
 
-    title = (snap["device"] or "FTMS")
+    title = snap["device"] or "FTMS"
     if snap["session"]:
         title += f"  ·  {snap['session']}"
-    clock = time.strftime("%H:%M:%S")
+    clock_txt = time.strftime("%H:%M:%S")
     status_txt = paint(status, scolor) if color else status
-    out = [_titled(cols, title, f"{status_txt} {clock}")]
-
+    out = [_titled(cols, title, f"{status_txt} {clock_txt}")]
     inner = cols - 2
-    gap = 2                                   # 左右两栏之间的空隙
-    half = (inner - gap) // 2                 # 左栏宽
-    other = inner - gap - half                # 右栏宽
 
-    # ---- 大字：速度 | 心率 ----
-    speed_txt = f"{snap['speed']:.2f}" if snap["speed"] < 100 else f"{snap['speed']:.0f}"
-    speed_block = big(speed_txt.replace(".", ".")[:5])
-    hr_block = big(str(hr)[:3] if hr else "--")
+    clock = _fmt_clock(snap["elapsed"])
+    minutes = str(int(snap["elapsed"]) // 60)
 
-    for i in range(BIG_ROWS):
-        left = center(speed_block[i], half)
-        right = center(hr_block[i], other)
-        if color:
-            left = paint(left, "cyan")
-            right = paint(right, zcolor)
-        out.append(_row(left + " " * gap + right, cols))
-
-    # ---- 单位 + 心率分区条 ----
-    left_unit = center("km/h", half)
-    if hr:
-        filled = max(0, min(10, pct // 10))
-        bar = "█" * filled + "░" * (10 - filled)
-        if color:
-            bar = paint(bar, zcolor)
-        right_unit = f"{bar} {zone} {pct}%"
-    else:
-        right_unit = "无心率广播"
-    out.append(_row(left_unit + " " * gap + center(right_unit, other), cols))
-
-    # ---- 指标格 ----
-    out.append(_rule(cols))
-    cells = [
-        ("步频", f"{snap['cadence']}", " spm"),
-        ("阻力", f"{snap['resistance']:.0f}", "%"),
-        ("功率", f"{snap['power']}", " W"),
-        ("距离", f"{snap['distance']}", " m"),
-        ("时间", _fmt_clock(snap["elapsed"]), ""),
-        ("消耗", f"{snap['kcal']:.0f}", " kcal"),
+    band1 = [
+        {"label": "速度", "value": f"{snap['speed']:.2f}", "unit": "km/h",
+         "style": "cyan"},
+        {"label": "心率", "value": str(hr) if has_hr else "--", "unit": "bpm",
+         "style": "red" if has_hr else "grey", "heart": True, "has_hr": has_hr},
     ]
-    cell_w = max(12, min(26, inner // 3))
-    per_line = max(1, inner // cell_w)
-    per_line = min(per_line, len(cells))
-    for start_i in range(0, len(cells), per_line):
-        chunk = cells[start_i:start_i + per_line]
-        parts = []
-        for i, (label, value, unit) in enumerate(chunk):
-            text = f"{label} {value}{unit}"
-            width = (cell_w if i < len(chunk) - 1
-                     else inner - cell_w * (len(chunk) - 1))
-            text = clip(" " + text, width)
-            parts.append(ljust(text, width))
-        out.append(_row("".join(parts), cols))
+    band2 = [
+        {"label": "步频", "value": str(snap["cadence"]), "unit": "spm",
+         "style": "yellow"},
+        {"label": "阻力", "value": f"{snap['resistance']:.0f}", "unit": "%",
+         "style": "green", "meter": snap["resistance"]},
+        {"label": "功率", "value": str(snap["power"]), "unit": "W",
+         "style": "magenta"},
+    ]
+    band3 = [
+        {"label": "距离", "value": str(snap["distance"]), "unit": "m",
+         "style": "blue"},
+        {"label": "时间", "value": clock, "unit": "", "style": "white",
+         "fallback": minutes},
+        {"label": "消耗", "value": f"{snap['kcal']:.0f}", "unit": "kcal",
+         "style": "red"},
+    ]
 
-    out.append(_rule(cols))
+    bands = [band1]
+    if rows >= 17:
+        bands.append(band2)
+    if rows >= 23:
+        bands.append(band3)
 
-    # ---- 剩余空间全部给面积图，底部边框贴住屏幕最后一行 ----
-    remaining = rows - len(out) - 1
-    has_hr = bool(snap["hist_hr"])
+    for index, band in enumerate(bands):
+        if index:
+            out.append(_rule(cols))
+        out.extend(_row(line, cols) for line in _band_lines(band, inner, color, now))
+
+    # 图表只留给剩下的空间，最多 3 行
+    remaining = min(3, rows - len(out) - 1)
     if remaining > 0 and snap["hist_speed"]:
-        if has_hr and remaining >= 6:
-            speed_h = max(2, (remaining - 2) // 2) + 1
-            hr_h = remaining - speed_h
-        else:
-            speed_h, hr_h = remaining, 0
-
-        def chart(label, values, height, style, vmax=None):
-            if height <= 0:
-                return []
-            tag_w = 7
-            body = _area(values, inner - tag_w - 2, height, vmax)
-            lines = []
-            for i, row_txt in enumerate(body):
-                tag = label.center(tag_w) if i == 0 else " " * tag_w
-                if color and i == 0:
-                    tag = paint(tag, "dim")
-                colored = paint(row_txt, style) if color else row_txt
-                lines.append(" " + tag + " " + colored)
-            return lines
-
-        chart_lines = []
-        if speed_h > 0:
-            chart_lines += chart("速度", snap["hist_speed"], speed_h, "cyan")
-        if hr_h > 0:
-            chart_lines += chart("心率", [float(v) for v in snap["hist_hr"]], hr_h, "red")
-        for line in chart_lines[:remaining]:
-            out.append(_row(line, cols))
+        spark = _spark(snap["hist_speed"], inner - 7)
+        out.append(_row(" 速度 " + (paint(spark, "cyan") if color else spark), cols))
+        remaining -= 1
+    if remaining > 0 and snap["hist_hr"]:
+        spark = _spark([float(v) for v in snap["hist_hr"]], inner - 7)
+        out.append(_row(" 心率 " + (paint(spark, "red") if color else spark), cols))
 
     while len(out) < rows - 1:
         out.append(_row("", cols))
