@@ -8,9 +8,7 @@ After=bluetooth.target
 [Service]
 Type=simple
 WorkingDirectory=%h/elliptical-ftms
-ExecStart=/usr/bin/python3 %h/elliptical-ftms/ftms_capture.py \
-    --config %h/elliptical-ftms/config.toml --auto
-# 输出重定向到日志，方便 journalctl 之外直接 tail
+ExecStart=/usr/bin/python3 %h/elliptical-ftms/ftms_capture.py --config %h/elliptical-ftms/config.toml --auto
 Environment=PYTHONUNBUFFERED=1
 
 # 踩完一局就退出说明出了大问题（蓝牙假死之类），重启它
