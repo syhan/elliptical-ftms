@@ -380,6 +380,15 @@ ssh syhan@10.0.0.177
 ~/elliptical-ftms/deploy/install.sh
 ```
 
+之后更新代码**不要**在目标机上 `git pull` —— 它访问 GitHub 经常超时。用：
+
+```bash
+./deploy/sync.sh syhan@10.0.0.177
+```
+
+这条命令走 SSH 直推（目标机需要先 `git config receive.denyCurrentBranch updateInstead`），
+推完自动重启服务，整个过程不依赖 GitHub。
+
 `install.sh` 会装 `bluez` + `python3-gi`、克隆仓库、生成 `config.toml`、
 装一个 **systemd 用户服务**并 `enable-linger`（不登录也随开机启动）。
 
@@ -619,6 +628,8 @@ elliptical-ftms/
 ├── export_fit.py          # CSV → FIT 导出（自带编码器与校验器）
 ├── deploy/
 │   ├── install.sh                 # 目标机一键部署
+│   ├── sync.sh                    # 开发机直推更新（不走 GitHub）
+│   ├── mosquitto-elliptical.conf  # 局域网 MQTT broker 配置
 │   └── elliptical-ftms.service    # systemd 用户服务
 └── data/                  # 采集输出（已 gitignore）
 ```

@@ -91,9 +91,18 @@ fi
 
 say "4/6 取仓库"
 if [ -d "$DIR/.git" ]; then
-    git -C "$DIR" pull --ff-only
+    # 目标机访问 GitHub 可能超时，拉不到就先用本地现有代码，别把安装搞崩
+    if git -C "$DIR" pull --ff-only -q 2>/dev/null; then
+        echo "  已更新到 $(git -C "$DIR" log --oneline -1)"
+    else
+        echo "  ! 从 $REPO 拉取失败（网络？），继续使用当前版本"
+        echo "    可在开发机上用 deploy/sync.sh 推送，不依赖 GitHub"
+    fi
 else
-    git clone "$REPO" "$DIR"
+    git clone "$REPO" "$DIR" || {
+        echo "  ! clone 失败。请在开发机上执行 deploy/sync.sh 推过来" >&2
+        exit 1
+    }
 fi
 if [ ! -f "$DIR/config.toml" ]; then
     cp "$DIR/config.toml.example" "$DIR/config.toml"
