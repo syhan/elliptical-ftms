@@ -422,13 +422,20 @@ RES_LEVELS = " ▁▂▃▄▅▆▇█"
 
 
 def res_meter(pct: float, cells: int = 10) -> list[tuple[str, bool]]:
-    """阻力格栅：高度递增的一排小竖条，亮起的部分表示当前阻力。"""
+    """阻力格栅：高度递增的一排小竖条，像信号强度那样。
+
+    未点亮的格子统一画最低那一格 ▁，所以即使在无色终端里也能一眼看出
+    点亮到第几格（否则未点亮也画自己的高度，看着永远是一整条楼梯）。
+    """
     pct = max(0.0, min(100.0, pct))
     lit = int(round(pct / 100.0 * cells))
     out = []
     for i in range(cells):
-        height = 1 + round(i * (len(RES_LEVELS) - 2) / max(1, cells - 1))
-        out.append((RES_LEVELS[height], i < lit))
+        if i < lit:
+            height = 1 + round(i * (len(RES_LEVELS) - 2) / max(1, cells - 1))
+            out.append((RES_LEVELS[height], True))
+        else:
+            out.append((RES_LEVELS[1], False))
     return out
 
 
