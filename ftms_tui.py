@@ -184,6 +184,10 @@ class LiveState:
         with self._lock:
             self._ver += 1
             self.started = started
+            if session and self.session and session != self.session:
+                # 换了一局，曲线不能和上一局接在一起
+                self.hist_speed.clear()
+                self.hist_hr.clear()
             if session:
                 self.session = session
             self.elapsed = frame.elapsed_s
@@ -213,9 +217,27 @@ class LiveState:
             self._ver += 1
 
     def set_idle(self) -> None:
-        """设备断开时清掉“记录中”的标记。"""
+        """一局结束后清空读数。
+
+        只改 started 是不够的：设备关机后 TUI 会一直显示上一局冻结的
+        距离/时间，第二天连进来还以为数据没清零。
+        """
         with self._lock:
             self.started = False
+            self.elapsed = 0
+            self.speed = 0.0
+            self.avg_speed = 0.0
+            self.cadence = 0
+            self.resistance = 0.0
+            self.power = 0
+            self.distance = 0
+            self.kcal = 0.0
+            self.hr = 0
+            self.frame_at = 0.0
+            self.hr_at = 0.0
+            self.hist_speed.clear()
+            self.hist_hr.clear()
+            self.session = ""
             self._ver += 1
 
     def snapshot(self) -> tuple[int, dict]:
@@ -248,6 +270,14 @@ LIVE = LiveState()
 # --------------------------------------------------------------------------- #
 # 渲染
 # --------------------------------------------------------------------------- #
+
+STALE_AFTER = 15.0          # 超过这个秒数没数据就认为设备不在了
+
+
+def _is_stale(snap: dict) -> bool:
+    age = snap.get("age")
+    return age is None or age > STALE_AFTER
+
 
 def _status_of(snap: dict) -> tuple[str, str]:
     age = snap["age"]
@@ -341,15 +371,20 @@ def _box_lines(lines: list[str], width: int) -> list[str]:
 def render_compact(snap: dict, cols: int, rows: int, color: bool = True) -> list[str]:
     """窄屏 / 矮屏：一行或几行纯文本。"""
     status, scolor = _status_of(snap)
-    hr = snap["hr"]
-    parts = [
-        f"{snap['speed']:5.2f}km/h",
-        f"{snap['cadence']:3d}spm",
-        f"{snap['resistance']:4.0f}%",
-        f"{snap['power']:4d}W",
-        f"{snap['distance']:5d}m",
-        _fmt_clock(snap["elapsed"]),
-    ]
+    stale = _is_stale(snap)
+    hr = snap["hr"] if not stale else 0
+    if stale:
+        parts = ["-- km/h", "-- spm", "-- W", "-- m"]
+    else:
+        parts = [
+            f"{snap['speed']:5.2f}km/h",
+            f"{snap['cadence']:3d}spm",
+            f"{snap['resistance']:4.0f}%",
+            f"{snap['power']:4d}W",
+            f"{snap['distance']:5d}m",
+            _fmt_clock(snap["elapsed"]),
+        ]
+    parts.append(time.strftime("%H:%M"))
     if hr:
         parts.append(f"♥{hr}")
     # 按宽度贪心换行，尽量用满可用行数
@@ -373,8 +408,9 @@ def render_compact(snap: dict, cols: int, rows: int, color: bool = True) -> list
 def render_medium(snap: dict, cols: int, rows: int, color: bool = True) -> list[str]:
     """中等屏幕：有边框，没有大字。"""
     status, scolor = _status_of(snap)
+    stale = _is_stale(snap)
     hr = snap["hr"]
-    has_hr = hr > 0
+    has_hr = hr > 0 and not stale
 
     title = snap["device"] or "FTMS"
     status_txt = paint(status, scolor) if color else status
@@ -383,7 +419,7 @@ def render_medium(snap: dict, cols: int, rows: int, color: bool = True) -> list[
 
     # 主数值行
     inner = cols - 2
-    num = f"{snap['speed']:6.2f}"
+    num = "--" if stale else f"{snap['speed']:6.2f}"
     left = (paint(num, "bold", "cyan") if color else num) + " km/h"
     heart = _heart(has_hr, snap["now"], color)
     if has_hr:
@@ -395,17 +431,19 @@ def render_medium(snap: dict, cols: int, rows: int, color: bool = True) -> list[
     out.append(_row(" " + left + " " * gap + right, cols))
 
     out.append(_rule(cols))
-    out.append(_row(" " + f"步频 {snap['cadence']:3d} spm   "
-                          f"阻力 {snap['resistance']:3.0f}%   "
-                          f"功率 {snap['power']:3d} W", cols))
-    out.append(_row(" " + f"距离 {snap['distance']:5d} m    "
-                          f"时间 {_fmt_clock(snap['elapsed'])}   "
-                          f"卡路里 {snap['kcal']:.0f}", cols))
+    cad = "--" if stale else f"{snap['cadence']:3d}"
+    res = "--" if stale else f"{snap['resistance']:3.0f}"
+    pwr = "--" if stale else f"{snap['power']:3d}"
+    dist = "--" if stale else f"{snap['distance']:5d}"
+    tme = "--" if stale else _fmt_clock(snap["elapsed"])
+    kcal = "--" if stale else f"{snap['kcal']:.0f}"
+    out.append(_row(" " + f"步频 {cad} spm   阻力 {res}%   功率 {pwr} W", cols))
+    out.append(_row(" " + f"距离 {dist} m   时间 {tme}   卡路里 {kcal}", cols))
     out.append(_rule(cols))
 
     # 剩下的空间给迷你图
     left_rows = max(0, rows - len(out) - 1)
-    if left_rows > 0 and snap["hist_speed"]:
+    if left_rows > 0 and snap["hist_speed"] and not stale:
         speed_line = _spark(snap["hist_speed"], inner - 8)
         out.append(_row(" 速度 " + (paint(speed_line, "cyan") if color else speed_line), cols))
         left_rows -= 1
@@ -526,35 +564,42 @@ def render_full(snap: dict, cols: int, rows: int, color: bool = True) -> list[st
     out = [_title_line(cols, title, date, wall, status_txt, color)]
     inner = cols - 2
 
+    stale = _is_stale(snap)
+    has_hr = has_hr and not stale
+
+    def val(text: str) -> str:
+        """数据过期就显示占位符，别把上一局的数值一直挂在屏幕上。"""
+        return "--" if stale else text
+
     clock = _fmt_clock(snap["elapsed"])
     minutes = str(int(snap["elapsed"]) // 60)
 
     band1 = [
-        {"label": "瞬时速度", "value": f"{snap['speed']:.2f}", "unit": "km/h",
+        {"label": "瞬时速度", "value": val(f"{snap['speed']:.2f}"), "unit": "km/h",
          "style": "cyan"},
         {"label": "心率", "value": str(hr) if has_hr else "--", "unit": "bpm",
          "style": "red" if has_hr else "grey", "heart": True, "has_hr": has_hr},
     ]
     band2 = [
-        {"label": "步频", "value": str(snap["cadence"]), "unit": "spm",
+        {"label": "步频", "value": val(str(snap["cadence"])), "unit": "spm",
          "style": "yellow"},
-        {"label": "阻力", "value": f"{snap['resistance']:.0f}", "unit": "%",
-         "style": "green", "meter": snap["resistance"]},
-        {"label": "功率", "value": str(snap["power"]), "unit": "W",
+        {"label": "阻力", "value": val(f"{snap['resistance']:.0f}"), "unit": "%",
+         "style": "green", "meter": 0.0 if stale else snap["resistance"]},
+        {"label": "功率", "value": val(str(snap["power"])), "unit": "W",
          "style": "magenta"},
     ]
     band3 = [
-        {"label": "距离", "value": str(snap["distance"]), "unit": "m",
+        {"label": "距离", "value": val(str(snap["distance"])), "unit": "m",
          "style": "blue"},
-        {"label": "消耗", "value": f"{snap['kcal']:.0f}", "unit": "kcal",
+        {"label": "消耗", "value": val(f"{snap['kcal']:.0f}"), "unit": "kcal",
          "style": "red"},
     ]
     # 屏幕够高才有第四排。左上角那个大字本来就是瞬时速度，所以这里放
     # 用时和均速，跟第一排形成「瞬时 vs 平均」的对照，不重复。
     band4 = [
-        {"label": "用时", "value": clock, "unit": "", "style": "white",
+        {"label": "用时", "value": val(clock), "unit": "", "style": "white",
          "fallback": minutes},
-        {"label": "均速", "value": f"{snap['avg_speed']:.2f}", "unit": "km/h",
+        {"label": "均速", "value": val(f"{snap['avg_speed']:.2f}"), "unit": "km/h",
          "style": "cyan"},
     ]
 
@@ -573,11 +618,11 @@ def render_full(snap: dict, cols: int, rows: int, color: bool = True) -> list[st
 
     # 图表只留给剩下的空间，最多 3 行
     remaining = min(3, rows - len(out) - 1)
-    if remaining > 0 and snap["hist_speed"]:
+    if remaining > 0 and snap["hist_speed"] and not stale:
         spark = _spark(snap["hist_speed"], inner - 7)
         out.append(_row(" 速度 " + (paint(spark, "cyan") if color else spark), cols))
         remaining -= 1
-    if remaining > 0 and snap["hist_hr"]:
+    if remaining > 0 and snap["hist_hr"] and not stale:
         spark = _spark([float(v) for v in snap["hist_hr"]], inner - 7)
         out.append(_row(" 心率 " + (paint(spark, "red") if color else spark), cols))
 
