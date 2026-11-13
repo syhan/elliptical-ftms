@@ -67,6 +67,10 @@ RES_RAW_MAX = 91.0
 FRAME_LEN = 29
 DISCOVERY_SECONDS = 15.0
 RECONNECT_INTERVAL = 5.0
+# 连接正常但多久没收到 0x2ACE 就算「订阅失效」。设备闲置时也是 1 Hz 推零值，
+# 所以超过这个秒数一定不正常 —— 通常是别的 D-Bus 客户端调 StopNotify
+# 把共享的 CCCD 一起关掉了（bluetoothctl、我们的调试脚本都会这样）。
+RESUBSCRIBE_AFTER = 20.0
 
 # 导出 FIT 时的数据清洗阈值（与 export_fit.py 的默认值一致）
 FIT_MAX_HR_AGE = 10.0
@@ -368,6 +372,19 @@ class Bluez:
             self.call(char_path, CHAR_IFACE, "StopNotify", None, None, 3000)
         except GLib.Error:
             pass
+
+    def force_reconnect(self) -> None:
+        """断链重连。BlueZ 的订阅状态被外部搞坏时，重连是最干净的复位。"""
+        if not self.device_path:
+            return
+        for path in self.subscribed:
+            self.stop_notify(path)
+        self.subscribed = []
+        self.bz.disconnect(self.device_path)
+        self.connected = False
+        self.disconnected_since = time.monotonic()
+        self.last_frame_mono = None
+        self.attach()
 
     def disconnect(self, path: str) -> None:
         try:
@@ -785,11 +802,15 @@ class Capture:
 
         loop = GLib.MainLoop()
         self._loop = loop
+        self.last_frame_mono = None        # 上一局的帧龄不算进本局
         state = {
             "deadline": time.time() + deadline if deadline else None,
             "next_connect": 0.0,
             "hr_next": 0.0,
             "hr_warned": False,
+            "silent_ref": time.monotonic(),
+            "next_resub": 0.0,
+            "resub": 0,
         }
 
         def end(reason: str) -> None:
@@ -838,6 +859,29 @@ class Capture:
                       flush=True)
                 end("数据静默")
                 return False
+
+            # 订阅看门狗：连接明明是好的却收不到帧。别的客户端（bluetoothctl、
+            # 调试脚本）调 StopNotify 会把 BlueZ 里共享的 CCCD 一起关掉，我们这边
+            # 既不会报错也不会掉线，只是默默变聋 —— 不处理的话要等 5 分钟兜底超时。
+            if self.connected:
+                ref = self.last_frame_mono or state["silent_ref"]
+                silent = now_mono - ref
+                if silent <= RESUBSCRIBE_AFTER:
+                    state["resub"] = 0
+                elif now_mono >= state["next_resub"]:
+                    state["next_resub"] = now_mono + RESUBSCRIBE_AFTER
+                    state["resub"] += 1
+                    if state["resub"] <= 2:
+                        print(f"* 已 {silent:.0f}s 没收到数据（连接正常），重新订阅…",
+                              flush=True)
+                        for path in self.subscribed:
+                            self.stop_notify(path)
+                            self.start_notify(path)
+                    else:
+                        print(f"* 重新订阅仍无数据，强制重连…", flush=True)
+                        state["resub"] = 0
+                        state["next_resub"] = now_mono + RESUBSCRIBE_AFTER * 2
+                        self.force_reconnect()
 
             # 重连（节流，避免 attach 阻塞把循环卡死）
             if not self.connected and now_mono >= state["next_connect"]:
